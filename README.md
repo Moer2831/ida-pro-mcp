@@ -634,6 +634,31 @@ UI 定时器都会锁死主线程 —— 特征是"CPU 零增长、`.i64` 已解
 若仍遇到卡顿，请把 Output 窗口里的 `[MCP][cache] 派发耗时 ...ms` 警告与
 `cache_status` 的 `progress`/`pauses`/`slow_dispatches` 一起反馈，便于定位。
 
+**Q：工具调用报 `Method 'xxx' not found`（工具名找不到）？**
+
+几乎都是**客户端缓存的工具表过期**：MCP 客户端只在会话开始时拉一次 `tools/list`，
+之后插件升级/工具改名，旧会话里的名字就再也对不上了。实测踩到：本项目的实例扫描工具
+从 `list_instances` 改名为 `discover_local_instances`、实例切换从 `select_instance`
+改为 `redirect_to_instance`，已在运行的会话调用旧名直接失败。
+
+处理办法（任选）：
+
+- 重新建立 MCP 会话（重启客户端 / 重连插件：IDA 里按 `Ctrl+Alt+M`）；
+- 或直接用当前名字：实例列表用无参 `instance_list`（Broker 注册表，权威），
+  本机扫描用 `discover_local_instances`，切换实例用 `redirect_to_instance`；
+- 旧名已保留**兼容别名**（`list_instances` / `select_instance`），短期内调用旧名也能工作。
+
+2.1.6 起该错误消息会附带"刷新 tools/list 或改用当前名字"的提示与可用方法示例，
+不再是一句干巴巴的 `Method not found`。
+
+**Q：`discover_local_instances` 返回空列表（明明有 IDA 在跑）？**
+
+这是正常的：该工具扫描的是**旧的文件注册表** `~/.ida-pro-mcp/instances/instance_*.json`，
+而当前架构下实例是注册到 Broker 的 HTTP/SSE 上，这个目录通常是空的。
+查实例请用**无参 `instance_list`**（Broker 注册表）。
+2.1.6 起该工具**始终把"当前正在处理本次调用的实例"放进结果**（`source: "current"`），
+所以不会再出现"看起来一个实例都没有"的误导结果。
+
 **Q：改了仓库代码，但 IDA 行为没变？**
 
 插件是**拷贝**部署到 `%APPDATA%\Hex-Rays\IDA Pro\plugins` 的，重新部署并重启 IDA 才会生效

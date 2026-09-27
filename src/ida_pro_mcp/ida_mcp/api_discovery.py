@@ -11,6 +11,7 @@ IDA 窗口），与 broker 侧**无需参数**的 `instance_list`（在册实例
 
 import http.client
 import json
+import os
 import threading
 from collections import OrderedDict
 from typing import Annotated, NotRequired, TypedDict
@@ -53,7 +54,13 @@ _redirect_targets: dict[str, tuple[str, int]] = {}
 _redirect_lock = threading.Lock()
 
 # Tools that are always handled locally, never proxied
-_LOCAL_TOOL_NAMES = {"discover_local_instances", "redirect_to_instance"}
+_LOCAL_TOOL_NAMES = {
+    "discover_local_instances",
+    "redirect_to_instance",
+    # 兼容别名（旧版工具名）：必须一起列为"本地工具"，否则会被当成远端工具转发出去
+    "list_instances",
+    "select_instance",
+}
 
 
 def set_local_instance(host: str, port: int):
@@ -334,22 +341,70 @@ def discover_local_instances() -> list[InstanceListItem]:
     Needs an `instance_id` argument to be routed (get one from the no-argument `instance_list`,
     which lists the instances registered with the Broker). Use this tool only when you need the
     local-scan view, e.g. an IDA window that is not connected to the Broker yet.
+
+    NOTE: with the Broker architecture the authoritative list is the no-argument `instance_list`
+    (Broker 注册表)。本工具只做两件事：① 扫描旧的文件注册表
+    （`~/.ida-pro-mcp/instances/instance_*.json`，新架构下通常为空）；② **始终包含当前
+    正在处理本次调用的实例**，这样结果不会因为注册表为空而误导性地变成 `[]`。
     """
     instances = discover_instances()
     result = []
     redirect = get_redirect_target()
+    seen_local = False
     for inst in instances:
         reachable = probe_instance(inst["host"], inst["port"])
         if redirect:
             active = inst["host"] == redirect[0] and inst["port"] == redirect[1]
         else:
             active = inst["host"] == _LOCAL_HOST and inst["port"] == _LOCAL_PORT
+        if active:
+            seen_local = True
         result.append({
             **inst,
             "reachable": reachable,
             "active": active,
+            "source": "registry",
         })
+
+    # 当前实例兜底：旧注册表为空时也要能回答"我正跟谁说话"。
+    # 注意不能要求 `_LOCAL_PORT` 存在 —— Broker 架构下插件从不调用
+    # `set_local_instance()`，该值一直是 None（实测最后一行日志就是 `127.0.0.1:None`），
+    # 若以此为条件兜底永远不触发，结果仍是误导性的空列表。
+    if not seen_local:
+        result.insert(
+            0,
+            {  # type: ignore[arg-type]
+                "host": _LOCAL_HOST,
+                "port": _LOCAL_PORT or 0,
+                "pid": os.getpid(),
+                "reachable": True,
+                "active": redirect is None,
+                "source": "current",
+            },
+        )
     return result
+
+
+@tool
+def list_instances() -> list[InstanceListItem]:
+    """[Deprecated alias of `discover_local_instances`] 保留旧名以兼容已打开的 MCP 会话。
+
+    工具名曾在版本演进中变更；旧会话里缓存的工具表仍会用旧名调用。此别名与
+    `discover_local_instances` 行为完全一致，新代码请使用新名。
+    """
+    return discover_local_instances()
+
+
+@tool
+def select_instance(
+    port: Annotated[int, "Port number of the IDA instance to connect to"],
+    host: Annotated[str, "Host address of the IDA instance"] = "127.0.0.1",
+) -> InstanceSelectionResult:
+    """[Deprecated alias of `redirect_to_instance`] 保留旧名以兼容已打开的 MCP 会话。
+
+    传 `port=0` 可复位（回到当前实例）。新代码请使用 `redirect_to_instance`。
+    """
+    return redirect_to_instance(port=port, host=host)
 
 
 @tool

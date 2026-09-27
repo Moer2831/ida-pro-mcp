@@ -4,6 +4,25 @@
 上游来源：[QiuChenly/ida-pro-mcp-enhancement](https://github.com/QiuChenly/ida-pro-mcp-enhancement)
 → [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)。
 
+## 2.1.6
+
+主题：**工具名变更的兼容与可发现性**（多实例实测补测时暴露）。
+
+- fix: **`list_instances` / `select_instance` 恢复可用**。这两个工具此前改名为
+  `discover_local_instances` / `redirect_to_instance`，而 MCP 客户端只在会话开始时拉一次
+  `tools/list` —— 已打开的会话用旧名调用会直接失败（实测 `Method 'list_instances' not found`）。
+  现在旧名保留为**兼容别名**（文档标注 deprecated），并一起列入 `_LOCAL_TOOL_NAMES`，
+  否则会被误当成远端工具转发出去。
+- fix: **`-32601` 不再是一句干巴巴的 not found**。错误消息现在解释"客户端工具表可能已过期"，
+  提示重新获取 `tools/list` 或改用当前名字，并附可用方法示例。
+- fix: **`discover_local_instances` 不再误导性地返回空列表**。它扫描的是旧的文件注册表
+  `~/.ida-pro-mcp/instances/instance_*.json`，而当前架构实例注册在 Broker 上，该目录通常为空；
+  现在**始终把"当前正在处理本次调用的实例"放进结果**（`source: "current"`）。
+  实现细节：不能以 `_LOCAL_PORT` 存在为兜底条件 —— Broker 架构下插件从不调用
+  `set_local_instance()`，该值恒为 None，会导致兜底永不触发。
+- docs: README 增补两条排障 Q&A（`Method not found`、`discover_local_instances` 返回空）。
+- test: 新增 2 条静态守卫（改名工具必须保留别名且列入本地工具名单；`-32601` 必须带恢复提示），
+  全量 397 → 399 项通过。
 ## 2.1.5
 
 主题：**修复"保存 IDB 后卡死"的真正根因**（承接 2.1.4 的调查结论）。

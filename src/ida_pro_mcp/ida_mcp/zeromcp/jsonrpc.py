@@ -200,7 +200,18 @@ class JsonRpcRegistry:
 
     def _call(self, method: str, params: Any) -> Any:
         if method not in self.methods:
-            raise JsonRpcException(-32601, f"Method '{method}' not found")
+            # 工具名会随版本演进变更，而 MCP 客户端会缓存会话开始时的 tools/list ——
+            # 旧会话用旧名调用时就会走到这里（实测：list_instances 已改名为
+            # discover_local_instances，旧会话调用直接失败且毫无线索）。
+            # 因此在错误里带上"刷新工具表 / 用别名"的提示，让 AI 能自我纠正。
+            known = ", ".join(sorted(self.methods)[:8])
+            raise JsonRpcException(
+                -32601,
+                f"Method '{method}' not found。"
+                "若这是工具调用，通常是客户端缓存的工具表已过期：请重新获取 tools/list，"
+                "或改用当前名字（部分旧名保留了兼容别名）。"
+                f"本实例可用方法示例: {known} …",
+            )
 
         func = self.methods[method]
 

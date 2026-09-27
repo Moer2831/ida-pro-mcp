@@ -387,5 +387,35 @@ class StructuralGuardTests(unittest.TestCase):
         )
 
 
+    def test_renamed_tools_keep_deprecated_aliases(self) -> None:
+        """改名过的工具必须保留旧名别名，并一起列入"本地工具"。
+
+        为什么：MCP 客户端只在会话开始时拉一次 tools/list，插件升级后旧会话仍会用旧名
+        调用 —— 实测 `list_instances` 直接报 `Method 'list_instances' not found`。
+        别名要同时进 `_LOCAL_TOOL_NAMES`，否则会被当成远端工具转发出去。
+        """
+        source = (_SRC_ROOT / "ida_mcp" / "api_discovery.py").read_text(encoding="utf-8")
+        for old_name in ("list_instances", "select_instance"):
+            with self.subTest(tool=old_name):
+                self.assertIn(
+                    f"def {old_name}(",
+                    source,
+                    f"缺少 {old_name} 的兼容别名（改名会打断已打开的会话）",
+                )
+                self.assertIn(
+                    f'"{old_name}"',
+                    source,
+                    f"{old_name} 必须列进 _LOCAL_TOOL_NAMES（否则会被转发给远端实例）",
+                )
+
+    def test_method_not_found_error_has_recovery_hint(self) -> None:
+        """`-32601` 必须给出"刷新工具表 / 改用当前名字"的提示，而不是干巴巴一句 not found。"""
+        source = (
+            _SRC_ROOT / "ida_mcp" / "zeromcp" / "jsonrpc.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("tools/list", source, "-32601 应提示重新获取工具表")
+        self.assertIn("Method '{method}' not found", source)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
