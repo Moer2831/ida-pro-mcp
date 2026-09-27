@@ -6,7 +6,7 @@
 
 一套面向 IDA Pro 的 [MCP（Model Context Protocol）](https://modelcontextprotocol.io/introduction) 服务端，让大模型以结构化工具调用的方式读写 IDA IDB，用于逆向工程、二进制分析、Hook 开发等场景。
 
-英文原版文档请参阅 [README.en.md](./README.en.md)。本 README 描述的是在上游之上增强过的 Broker 架构与 SQLite 静态缓存接管层。
+英文原版文档请参阅 [README.en.md](./README.en.md)。本 README 描述的是在上游之上增强过的 Broker 架构与 SQLite 静态缓存接管层。版本改动记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
 示例视频与 prompt：见 [mcp-reversing-dataset](https://github.com/mrexodia/mcp-reversing-dataset)。
 
@@ -21,6 +21,7 @@
 - **Broker 注入虚拟工具**：`refresh_cache` 与 `cache_status` 作为虚拟 `ToolSchema` 追加到 `tools/list` 结果中，模型可以直接看到并调用，但它们并不在 Broker 执行，最终仍被路由到指定 IDA 实例。
 - **idalib 无头模式**：通过 `idalib-mcp` 运行纯 headless 服务，支持 `--isolated-contexts` 做严格的每连接上下文隔离。
 - **stdio 端自动拉起 Broker（本仓库新增）**：MCP 客户端（Cursor / Grok / Claude / VS Code…）以 stdio 启动本进程时，若本机没有监听中的 Broker，会自动用隐藏窗口（Windows `Start-Process -WindowStyle Hidden`）/ 独立会话（POSIX `start_new_session=True`）拉起一个，避免"忘记先开 Broker"导致 `instance_list` 为空；该行为只对回环地址生效（`127.0.0.1` / `localhost` / `::1`），远程 Broker 不会被自动拉起，可用 `--no-auto-broker` 关闭。
+- **大库内存重写（2.1.0）**：缓存构建从"整库物化成 Python 对象 + 单事务全量重写"改为**分块流式提取 + 影子表原子切换 + 表级指纹增量**，峰值内存 O(全库) → O(块)，且块间让出 IDA 主线程不再卡界面；查询侧补齐 `ea` 索引、去掉多余的 `COUNT(*)` 全表扫描。完整清单见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ---
 
@@ -409,6 +410,16 @@ uv run idalib-mcp --stdio
 uv run idalib-mcp --stdio --max-workers 4
 ```
 
+每个 worker 都是独立进程、各自加载一整份数据库，默认上限 4（`--max-workers` / `IDA_MCP_MAX_WORKERS`）。历史上会话只在显式 `idalib_close` 时才释放，长期挂着的 worker 会一直占内存；现在可以开启空闲回收：
+
+```bash
+uv run idalib-mcp --max-workers 2 --idle-ttl 600 --idle-sweep 30
+```
+
+- `--idle-ttl SEC`（环境变量 `IDA_MCP_IDLE_TTL_SEC`，默认 `0` = 关闭）：会话空闲超过该秒数后自动 `close_database()` 释放内存。
+- `--idle-sweep SEC`（环境变量 `IDA_MCP_IDLE_SWEEP_SEC`，默认 `30`，最小 `1`）：回收线程的扫描周期。
+- 绑定在活跃上下文上的会话永远不会被回收（需先 `idalib_unbind()`）；正在自动分析的会话也会跳过。
+
 ```python
 idalib_open("/path/to/binary_a.exe", session_id="binary_a")
 idalib_open("/path/to/library.dll", session_id="library")
@@ -509,21 +520,68 @@ uv pip install -e .
 
 ## 十五、大库使用建议（内存与性能）
 
-本项目的 SQLite 缓存是"用一次性的全量提取，换长期的高频只读查询加速"。在**大 IDB** 上，那次全量提取是最主要的内存与卡顿来源：
+> **2.1.0 起，本节描述的实现已重写**：缓存构建改为分块流式 + 影子表原子切换 +
+> 表级指纹增量，峰值内存从 O(全库) 降到 O(块)。下面的"机制"描述的是当前实现；
+> 历史实现（整库物化 + 单事务全量重写）的问题见 [CHANGELOG.md](./CHANGELOG.md)。
 
-- 提取实现在 `broker/sqlite_cache.py` 的 `_collect_all_data()`：把整库的 strings、string_xrefs、functions、function_xrefs（双向）、globals、imports 一次性建成 Python 对象。实测每行约 **244 B**（`tracemalloc`，百万行 ≈ 233 MB），千万级交叉引用即 2 GB 以上；而且整段提取跑在 IDA 主线程的 `execute_sync(..., MFF_READ)` 里，期间 IDA 界面会被占住。
-- 写入是一次性事务：`_write_data_to_db()` 先 `DELETE FROM` 六张表，再 `executemany` 全量重写，峰值 = 全量 Python 对象图 + WAL 膨胀。
-- 触发时机有三个：插件连接 Broker 后首次 IDA idle、**每次保存 IDB**（`IDB_Hooks.savebase()`）、30 分钟兜底轮询（IDB `mtime` 未变则跳过）。
-- 缓存文件写在 IDB 旁边（`<xxx.i64>.mcp.sqlite` 及 `-wal` / `-shm`），单事务重写期间 WAL 可能长到 GB 级，请预留磁盘空间。
+**当前实现的内存模型**
 
-据此推荐：
+- 提取在 `broker/cache_extract.py` 里按游标切片：每块经一次
+  `execute_sync(..., MFF_READ)` 派发到 IDA 主线程，块间让出消息循环，
+  因此 **GUI 不会长时间卡死**；块大小按实测耗时自适应（默认目标 150 ms/块）。
+- 写入在 `broker/cache_writer.py` 里进影子表 `<table>__new`，最后一次事务内
+  `DROP` → `RENAME` → 建索引原子切换：读者要么看到旧快照、要么看到新快照，
+  **不存在"表被清空"的窗口**。
+- 每个表组会先做一遍"只哈希不建对象"的指纹（`shape` 默认 / `full` 可选），
+  指纹未变则整组跳过写库。
+- 触发时机仍是三个：插件连接 Broker 后首次 IDA idle、**每次保存 IDB**
+  （`IDB_Hooks.savebase()`）、30 分钟兜底轮询（IDB `mtime` 未变则跳过）。
+- 缓存文件写在 IDB 旁边（`<xxx.i64>.mcp.sqlite` 及 `-wal` / `-shm`）；
+  构建结束会做一次 `wal_checkpoint(TRUNCATE)`，WAL 不会长期留着。
 
-1. **挑时机建缓存**：连上 Broker 后立刻调用一次 `refresh_cache(instance_id=...)`，用 `cache_status` 等到 `status=ready`，期间只开这一个库、别跑重活。建好之后同一个 IDB 第二次打开就是"秒开"。
-2. **建完就别频繁保存 IDB**：分析期间关掉 IDA 的定时自动保存、少按 Ctrl+S —— `mtime` 不变时 30 分钟那轮会被跳过，可以长期吃缓存红利。
-3. **一次只开一个大库**：每个 GUI IDA 实例都有自己的守护线程与缓存文件，N 个库 = N 份峰值。
-4. **想彻底不建缓存**：把 `<xxx.i64>.mcp.sqlite` 换成一个同名**目录**（或只读文件），守护线程初始化失败后会直接退出（Output 窗口可见 `[MCP][cache] 初始化数据库失败`），代价是 `find_regex / entity_query / list_funcs / list_globals / imports` 返回 `-32001`。
-5. **无头模式**（`idalib-mcp`）不启动缓存守护线程，内存主要取决于并发 worker 数（默认 4，见 `--max-workers` / `IDA_MCP_MAX_WORKERS`）：单库分析建议设为 1，用完调用 `idalib_close` 释放（没有 idle 自动卸载）。
-6. **让模型优先用分页工具**：7 个缓存工具都支持 `LIMIT/OFFSET`；避免用 `py_eval` 在 IDA 里遍历全库，也不要一次性索取"全部函数 / 全部字符串"。
+**配置项（环境变量）**
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `IDA_MCP_DISABLE_CACHE` | `0` | 设为 `1` 彻底关闭缓存守护线程（不建库、不提取）；7 个缓存工具会返回 `-32001` |
+| `IDA_MCP_CACHE_SCOPE` | `full` | `minimal` 只建 strings / functions / imports（不采集交叉引用与全局变量，更快更省内存）。scope 收窄时会清空范围外的表，避免返回过期交叉引用 |
+| `IDA_MCP_CACHE_CHUNK_ROWS` | `20000` | 每块行数上限；峰值内存 ≈ 单块大小 |
+| `IDA_MCP_CACHE_TARGET_CHUNK_MS` | `150` | 每块目标耗时，用于自适应调整块大小（越小越不卡 UI） |
+| `IDA_MCP_CACHE_MAX_ROWS` | `0` | 单表行数上限；超限则放弃该表本轮刷新（保留旧快照）并标记 `partial` |
+| `IDA_MCP_CACHE_MAX_RSS_MB` | `0` | 进程 RSS 上限；超限则停止本轮刷新（保留旧快照）并降级为 `degraded` |
+| `IDA_MCP_CACHE_INCREMENTAL` | `1` | `0` = 关闭表级指纹增量，强制全量重建 |
+| `IDA_MCP_CACHE_FINGERPRINT` | `shape` | `full` 会把字符串文本一起纳入指纹（更精确，建立指纹更慢） |
+
+**建议**
+
+1. **大库优先用 `minimal` 范围 + 关掉增量以外的默认值**：
+   `IDA_MCP_CACHE_SCOPE=minimal` 能直接砍掉最占空间的交叉引用表；
+   需要交叉引用时再切回 `full`（切换会自动重建）。
+2. **内存吃紧就给护栏**：`IDA_MCP_CACHE_MAX_RSS_MB=2048`，
+   超限时本轮刷新会放弃并保留旧快照，而不是把 IDA 拖爆。
+3. **不想建缓存就用开关，不要再用"把 .mcp.sqlite 变成目录"的偏方**：
+   设置 `IDA_MCP_DISABLE_CACHE=1` 即可，语义清晰且可观测。
+4. **无头模式**（`idalib-mcp`）不启动缓存守护线程，内存主要取决于并发 worker 数
+   （默认 4，见 `--max-workers` / `IDA_MCP_MAX_WORKERS`）：单库分析建议设为 1，
+   并开启空闲回收（`--idle-ttl 600 --idle-sweep 30`，见"十二、SSE 传输与无头 idalib"）。
+5. **让模型优先用分页工具**：7 个缓存工具都支持 `LIMIT/OFFSET`；
+   避免用 `py_eval` 在 IDA 里遍历全库，也不要一次性索取"全部函数 / 全部字符串"。
+
+**排障与基准**
+
+- `cache_status` 现在会回报 `progress`（阶段/表/已处理行/耗时/峰值 RSS）、
+  `partial`、`last_error`、`degraded_reason`、`tables_skipped`、`counts_source`
+  与 `schema_version`。`status=partial` 表示"还没有可用快照"，
+  `status=ready` + `partial=1` 表示"有旧快照可用，但本轮刷新有问题"。
+- 基准（不需要 IDA，可在 CI 里当门禁）：
+
+  ```bash
+  python -m ida_pro_mcp.benchmark --rows 200000 --legacy
+  python -m ida_pro_mcp.benchmark --rows 200000 --assert-peak-mb 64
+  ```
+
+  输出会给出"分块（新）"与"全量物化（旧）"的 Python 峰值内存、耗时与查询延迟，
+  并说明 RSS 列是进程级读数（权威指标是 `tracemalloc` 峰值）。
 
 ---
 
@@ -541,6 +599,12 @@ uv pip install -e .
 - `src/ida_pro_mcp/broker/sqlite_query.py` 插件侧只读查询（强类型）
 - `src/ida_pro_mcp/broker/cache_handlers.py` `tools/call` 的本地缓存拦截
 - `src/ida_pro_mcp/broker/cache_types.py` 全部协议 `TypedDict`（`JsonRpcRequest / Response / Error / ToolSchema / *Args / *Result`）
+- `src/ida_pro_mcp/broker/cache_config.py` 缓存构建配置与环境变量解析（纯逻辑）
+- `src/ida_pro_mcp/broker/cache_extract.py` 游标式分块提取 + 表级指纹（无 IDA 依赖，可假后端单测）
+- `src/ida_pro_mcp/broker/cache_backend.py` IDAPython 后端适配器与主线程派发（`run_on_ida_main`）
+- `src/ida_pro_mcp/broker/cache_writer.py` 分块写入 + 影子表原子切换 + meta/进度
+- `src/ida_pro_mcp/broker/cache_rss.py` 零依赖 RSS 读数（内存护栏用）
+- `src/ida_pro_mcp/benchmark.py` 缓存层基准（峰值内存/耗时/查询延迟，可作 CI 门禁）
 
 新增工具只需：
 
@@ -568,6 +632,20 @@ uv run coverage erase
 uv run coverage run -m ida_pro_mcp.test tests/crackme03.elf -q
 uv run coverage run --append -m ida_pro_mcp.test tests/typed_fixture.elf -q
 uv run coverage report --show-missing
+```
+
+不需要 IDA 的回归测试（CI 也是跑这一套）：
+
+```bash
+cd tests && python -m unittest discover -s . -p "test_*.py" -v
+python -m ida_pro_mcp.benchmark --rows 200000 --legacy --assert-peak-mb 64
+```
+
+真 IDA（idalib）端到端集成测试，需要 `IDADIR` 指向 IDA 安装目录，否则自动跳过：
+
+```bash
+set IDADIR=D:\IDA
+cd tests && python -m unittest test_cache_idalib -v
 ```
 
 ---

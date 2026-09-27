@@ -1,0 +1,16 @@
+# 统一换行符与二进制标记：避免 Windows 上 core.autocrlf 造成的满屏假 diff
+* text=auto eol=lf
+
+# 测试与打包产物
+*.elf binary
+*.i64 binary
+*.idb binary
+*.dll binary
+*.png binary
+*.ico binary
+*.zstd binary
+
+# 脚本换行（Windows 启动器由 PowerShell 5.1 读取，保持原样即可）
+*.ps1 text eol=crlf
+*.vbs text eol=crlf
+*.bat text eol=crlf
