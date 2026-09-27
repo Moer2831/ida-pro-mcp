@@ -19,6 +19,10 @@ class _FakeBrokerClient:
     def has_instances(self) -> bool:
         return bool(self.instances)
 
+    def ping(self) -> bool:
+        """Broker 探活（真实 client 用它区分"Broker 挂了"与"没有实例"）。"""
+        return True
+
     def send_request(
         self,
         request: dict,

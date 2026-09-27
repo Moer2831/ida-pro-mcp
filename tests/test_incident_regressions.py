@@ -36,7 +36,7 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _cache_fakes import FakeBackend  # noqa: E402
 
-from ida_pro_mcp.broker import cache_autostart, sqlite_cache  # noqa: E402
+from ida_pro_mcp.broker import cache_autostart, cache_config, sqlite_cache  # noqa: E402
 
 # 会被装进 sys.modules 的假 IDA 模块
 _IDA_MODULES = (
@@ -320,6 +320,91 @@ class _FakeIdaTestBase(unittest.TestCase):
 
     def cache_db(self, idb_path: str | None = None) -> str:
         return (idb_path or self.idb) + ".mcp.sqlite"
+
+
+class MainThreadHeartbeatTests(unittest.TestCase):
+    """主线程心跳闸：主线程被长任务占住时，一律不许派发。
+
+    实测事故（2.1.3 复现）：密集写操作之后保存 IDB，守护线程正好在保存开始前后
+    派发了 `MFF_READ`，请求排进 IDA 队列，而 `save_database()` 内部的等待又在等
+    队列排空 —— IDA 全 16 个线程停在 Wait、CPU 冻结在 100.6s、界面无响应。
+    根因是"空闲标志是过期采样"：主线程卡住时定时器不再刷新，标志停在 True。
+    """
+
+    def _handle(self, *, ticks: int) -> sqlite_cache._DaemonHandle:  # noqa: SLF001
+        handle = sqlite_cache._DaemonHandle(  # noqa: SLF001
+            idb_path="x.i64",
+            db_path="x.i64.mcp.sqlite",
+            thread=None,
+            stop_event=threading.Event(),
+            force_event=threading.Event(),
+            idle_backend=FakeBackend(idle=True),
+        )
+        # 直接置位，避免 set_idle() 顺带把 ticks 加一（ticks==0 表示"无插件定时器"）
+        handle.idle_state.idle = True
+        handle.idle_state.ticks = ticks
+        return handle
+
+    def test_fresh_heartbeat_allows_dispatch(self) -> None:
+        handle = self._handle(ticks=1)
+        sqlite_cache.refresh_idle_states()  # 主线程刚心跳过
+        self.assertTrue(sqlite_cache._gate_ready(handle))  # noqa: SLF001
+
+    def test_stale_heartbeat_blocks_dispatch(self) -> None:
+        handle = self._handle(ticks=1)  # 有插件定时器（ticks>0）
+        with mock.patch.object(sqlite_cache, "_heartbeat_age", lambda: 30.0):
+            self.assertFalse(
+                sqlite_cache._gate_ready(handle),  # noqa: SLF001
+                "主线程心跳过期（=卡在长任务里）时绝不能派发 MFF_READ",
+            )
+
+    def test_never_heartbeat_falls_back_to_plain_gate(self) -> None:
+        """从未有过心跳（无头/单测）时不受心跳约束，否则会把无 IDA 场景永久挡住。"""
+        handle = self._handle(ticks=1)
+        with mock.patch.object(sqlite_cache, "_last_heartbeat", 0.0):
+            self.assertTrue(sqlite_cache._gate_ready(handle))  # noqa: SLF001
+
+    def test_stale_heartbeat_after_first_tick_blocks(self) -> None:
+        """一旦有过心跳（插件定时器跑过），停跳就必须挡住派发。"""
+        handle = self._handle(ticks=1)
+        with mock.patch.object(sqlite_cache, "_last_heartbeat", time.monotonic()):
+            self.assertTrue(sqlite_cache._gate_ready(handle))  # noqa: SLF001
+            with mock.patch.object(sqlite_cache, "_heartbeat_age", lambda: 99.0):
+                self.assertFalse(sqlite_cache._gate_ready(handle))  # noqa: SLF001
+
+    def test_fallback_mode_ignores_heartbeat(self) -> None:
+        """没有插件定时器（无 IDA / 单测）时退化为纯门控，不能被心跳卡住。"""
+        handle = self._handle(ticks=0)
+        with mock.patch.object(sqlite_cache, "_last_heartbeat", 0.0):
+            self.assertTrue(sqlite_cache._gate_ready(handle))  # noqa: SLF001
+
+    def test_closed_gate_still_wins(self) -> None:
+        handle = self._handle(ticks=1)
+        sqlite_cache.refresh_idle_states()
+        handle.idle_state.set_idle(False)  # 门控本身关闭
+        self.assertFalse(sqlite_cache._gate_ready(handle))  # noqa: SLF001
+
+    def test_refresh_updates_heartbeat(self) -> None:
+        with mock.patch.object(sqlite_cache, "_last_heartbeat", 0.0):
+            sqlite_cache.refresh_idle_states()
+            self.assertLessEqual(sqlite_cache._heartbeat_age(), 1.0)  # noqa: SLF001
+
+    def test_build_cache_receives_gated_wait_ready(self) -> None:
+        """`_run_build_once` 必须把门控（而非裸的 is_ready）交给 build_cache。"""
+        handle = self._handle(ticks=1)
+        seen: list[object] = []
+
+        def _fake_build(db_path, backend, config, **kwargs):  # noqa: ANN001
+            seen.append(kwargs.get("wait_ready"))
+            return sqlite_cache.CacheStats()
+
+        with mock.patch.object(sqlite_cache, "build_cache", _fake_build):
+            sqlite_cache._run_build_once(handle, FakeBackend(), cache_config.load_cache_config({}))  # noqa: SLF001
+        self.assertEqual(len(seen), 1)
+        gate = seen[0]
+        self.assertIsNotNone(gate, "构建必须收到门控回调")
+        with mock.patch.object(sqlite_cache, "_heartbeat_age", lambda: 30.0):
+            self.assertFalse(gate(), "交给构建的门控必须包含心跳检查")  # type: ignore[operator]
 
 
 class StartupDisciplineTests(_FakeIdaTestBase):

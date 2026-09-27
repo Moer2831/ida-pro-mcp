@@ -65,3 +65,12 @@ class BrokerClient:
     def has_instances(self) -> bool:
         """是否有已连接实例"""
         return len(self.list_instances()) > 0
+
+    def ping(self) -> bool:
+        """Broker 是否可达。
+
+        必须和"没有实例"区分开：Broker 挂掉时 `list_instances()` 会吞掉连接异常
+        返回 `[]`，上层就会把"Broker 没运行"误报成"没有活动实例，请启动 IDA" ——
+        实测踩到（Broker 被重启后，AI 得到的是"没有实例"而不是"Broker 不可达"）。
+        """
+        return self._request("GET", "/api/instances") is not None

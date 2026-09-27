@@ -493,6 +493,11 @@ class _DaemonHandle:
 _daemons: dict[str, _DaemonHandle] = {}
 _daemons_lock = threading.Lock()
 
+# 主线程心跳（`refresh_idle_states` 每次被插件定时器调用时更新）。
+# 派发前要求它足够新鲜：主线程被长任务占住 = 采样不可信 = 不许派发。
+HEARTBEAT_STALE_SEC = 2.0
+_last_heartbeat: float = 0.0
+
 
 def _ida_idb_mtime(idb_path: str) -> float:
     try:
@@ -512,7 +517,7 @@ def _run_build_once(
         backend,
         config,
         should_stop=handle.stop_event.is_set,
-        wait_ready=handle.idle_state.is_ready,
+        wait_ready=lambda: _gate_ready(handle),
         idb_mtime=_ida_idb_mtime(handle.idb_path),
     )
     handle.last_stats = stats
@@ -562,8 +567,15 @@ def refresh_idle_states() -> int:
     锁死（表现为启动即无响应、CPU 零增长）。所以空闲状态由"启动时注册好的那一个定时器"
     统一刷新，而不是每个守护线程自己注册。
 
+    本函数同时打一次"主线程心跳"：定时器能跑 = 主线程没被长任务占住。派发前会校验
+    心跳新鲜度（见 `_gate_ready`）—— 这是保存卡死的第二道闸：主线程卡在 `save_database()`
+    里时定时器不会触发，空闲标志会停在上一次的 True，若此时派发 `MFF_READ`，请求会排进
+    IDA 的队列，而长任务内部的 `qwait` 又在等队列排空 → 循环等待、IDA 全线程 Wait。
+
     返回**成功刷新**的守护线程数量（探测抛异常的不计入，但也不影响其它实例）。
     """
+    global _last_heartbeat
+    _last_heartbeat = time.monotonic()
     with _daemons_lock:
         handles = [h for h in _daemons.values() if h.idle_backend is not None]
     refreshed = 0
@@ -574,6 +586,31 @@ def refresh_idle_states() -> int:
             continue
         refreshed += 1
     return refreshed
+
+
+def _heartbeat_age() -> float:
+    """距上一次主线程心跳的秒数（从未心跳过返回 inf）。"""
+    if _last_heartbeat <= 0.0:
+        return float("inf")
+    return max(0.0, time.monotonic() - _last_heartbeat)
+
+
+def _gate_ready(handle: _DaemonHandle) -> bool:
+    """派发前的最终门控：空闲 + 静默窗口 + **主线程心跳新鲜**。
+
+    为什么需要心跳：空闲标志是"上一次采样"的结果。主线程正卡在长任务里
+    （保存 IDB、自动分析、模态对话框）时采样会停止，标志停留在过期的 True；
+    守护线程据此派发 `MFF_READ` 就会把请求排进队列，与长任务形成循环等待
+    （实测：写操作密集后保存 IDB，IDA 全线程 Wait、CPU 冻结、界面无响应）。
+
+    没有插件定时器时（无 IDA 的纯 Python 环境 / 单测 / 无头 idalib）**从未有过心跳**，
+    此时退化为纯门控，不受心跳约束；一旦有心跳（插件定时器跑过），就必须保持新鲜。
+    """
+    if not handle.idle_state.is_ready():
+        return False
+    if handle.idle_state.ticks == 0 or _last_heartbeat <= 0.0:
+        return True
+    return _heartbeat_age() <= HEARTBEAT_STALE_SEC
 
 
 def _probe_idle_once(handle: _DaemonHandle) -> None:

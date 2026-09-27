@@ -1012,7 +1012,14 @@ def _apply_type_edit(edit: dict[str, Any]) -> SetTypeResult:
                 result["error"] = "Failed to set stack member type"
             return result
 
-        return {"edit": edit, "kind": kind, "error": f"Unknown kind: {kind}"}
+        return {
+            "edit": edit,
+            "kind": kind,
+            "error": (
+                f"Unknown kind: {kind!r}；可用值: any/struct/union/enum/typedef/"
+                "func/ptr/udt，或直接省略 kind，由工具按 addr+ty 自动识别"
+            ),
+        }
     except Exception as e:
         return {"edit": edit, "error": str(e)}
 

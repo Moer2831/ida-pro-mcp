@@ -98,6 +98,11 @@ def register_broker_tools(mcp):
     @mcp.tool
     def instance_list() -> list[dict]:
         """列出所有已连接的 IDA/Hopper 实例。无需加载 IDB。返回 instance_id,name,binary_path,idb_path,base_addr。"""
+        if not ensure_broker_available():
+            raise RuntimeError(
+                "本机 Broker 未运行且自动拉起失败（127.0.0.1:13337）。"
+                "日志见 ~/.ida-pro-mcp/broker-13337.log；可手动常开一个：ida-pro-mcp --broker。"
+            )
         return get_broker_client().list_instances()
 
     @mcp.tool
@@ -129,9 +134,49 @@ def _instance_hint() -> str:
     return f" 当前可用实例: {pairs}。"
 
 
+def ensure_broker_available() -> bool:
+    """确保本机 Broker 可用：不可达时按需后台拉起；返回最终是否可达。
+
+    为什么需要：`ensure_local_broker()` 只在 MCP 服务端**启动时**调用一次。
+    Broker 中途挂掉（崩溃、被手工结束、端口被占后重启）之后，本会话里所有工具
+    都会静默失败或退化成"没有活动实例"，用户只能重启整个 MCP 客户端。
+    这里在每次需要 Broker 的操作前做一次探活 + 自愈。
+    """
+    broker = get_broker_client()
+    if broker.ping():
+        return True
+    try:
+        from ..server import ensure_local_broker
+    except Exception:  # noqa: BLE001 - 独立使用 broker 包时没有 server 模块
+        return False
+    try:
+        url = os.environ.get("IDA_MCP_BROKER_URL", "http://127.0.0.1:13337")
+        ensure_local_broker(url)
+    except Exception:  # noqa: BLE001 - 拉起失败按不可达处理
+        return False
+    return get_broker_client().ping()
+
+
 def route_to_ida(request: dict) -> JsonRpcResponse | None:
     """将请求路由到指定的 IDA 实例 (通过 Broker)。"""
     broker = get_broker_client()
+    # 兼容没有 ping() 的自定义 client（第三方注入 / 旧版替身）：探不了就当作可达，
+    # 交由后面的 has_instances() 决定行为，避免把"探活"变成硬依赖。
+    ping = getattr(broker, "ping", None)
+    reachable = bool(ping()) if callable(ping) else True
+    if not reachable and not ensure_broker_available():
+        return {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": (
+                    "本机 Broker 未运行且自动拉起失败（127.0.0.1:13337）。"
+                    "日志见 ~/.ida-pro-mcp/broker-13337.log；"
+                    "可手动常开一个：ida-pro-mcp --broker。"
+                ),
+            },
+            "id": request.get("id"),
+        }
     if not broker.has_instances():
         return {
             "jsonrpc": "2.0",

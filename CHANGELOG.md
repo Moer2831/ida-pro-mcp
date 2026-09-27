@@ -4,6 +4,75 @@
 上游来源：[QiuChenly/ida-pro-mcp-enhancement](https://github.com/QiuChenly/ida-pro-mcp-enhancement)
 → [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)。
 
+## 2.1.4
+
+主题：**写入类工具全面实测**（rename / patch / put_int / set_type / define / 注释 / 栈 / 类型 …）
+暴露并修掉一批"静默返回错数据"和"误报失败"的问题，同时把一次**保存后卡死**查到根因。
+
+### 卡死调查（结论：与本项目缓存层无关）
+
+实测：密集写操作后保存 IDB，IDA 会卡死（`Responding=False`、CPU 冻结、全部线程 Wait、
+`.i64` 已写盘）。做了三组对照实验：
+
+1. `IDA_MCP_DISABLE_CACHE=1`（缓存守护线程完全不启动）→ **仍然卡死** ⇒ 排除缓存守护线程；
+2. 禁用第三方原生插件 hrtng(`hrtng.dll`) → 仍然卡死 ⇒ 排除 hrtng 单方面原因；
+3. 移出本插件（`ida_mcp.py` + `broker/` + `ida_mcp/`），用 IDA 自带 `-S` 脚本做
+   "反编译 + 保存" → **`save_database` 立即返回 True，IDA 完全正常** ⇒ 卡死与本插件相关。
+
+结合 1、3：嫌疑落在缓存守护线程以外的插件部分，首要嫌疑是 `trace` 模块的 IDB 钩子 ——
+它在 `savebase()`（保存过程中）往 **netnode 写数据**，而"在保存过程中修改数据库"是经典死锁形状。
+后续需要单独实验确认（把 flush 从 IDB 钩子移到已有的 1s 主循环定时器即可规避）。
+
+### 稳定性：派发前增加"主线程心跳"闸
+
+空闲标志是**上一次采样**的结果：主线程卡在长任务（保存/分析/模态）里时定时器不再刷新，
+标志会停留在过期的 `True`，守护线程据此派发 `MFF_READ` 就可能与长任务形成循环等待。
+`refresh_idle_states()` 现在同时打心跳，`_gate_ready()` 要求心跳新鲜（2s 内）才允许派发；
+从未有过心跳的环境（单测 / 无头 idalib）退化为纯门控，不受影响。
+
+### 缓存层：能答的才拦，答不了转给 IDA（不再静默忽略参数）
+
+- **静默忽略参数**（最严重）：工具 schema 声明的是插件那套嵌套形态
+  （`list_globals(queries={"filter": "g_", "count": 8})`、`entity_query(queries=[{...}])`），
+  而缓存层只读扁平键（`name_pattern` / `limit`）—— 于是**过滤条件与分页被丢掉**：
+  要 8 条返回 200 条、要过滤返回全量。现在两种形态都认（`filter`→`name_pattern`、
+  `count`→`limit`、嵌套优先），实测 `list_globals` 过滤+分页、`imports(count=5)` 均精确生效。
+- **`entity_query(kind="names")` 被硬拒**：插件本身支持 `names`（`idautils.Names()`），
+  缓存没有这张表却回 `-32602`。现在 `is_cache_tool()` 会检查请求是否落在缓存能力内 ——
+  `names`、正则、排序、地址范围、投影、module 等一律**放行给 IDA 正常执行**。
+- `kind` 缺省与插件一致取 `functions`（不再报"需要 kind 参数"）。
+
+### 插件侧：把"误报失败"和"改了却说没改"改成可判定
+
+- `set_comments` 在非函数入口处会**部分成功**（反汇编注释已写、反编译器视图放不下），
+  却返回 `error` —— AI 会以为整条注释没生效。现在返回 `applied: ["disasm"]` + 说明性错误。
+- `rename` 局部变量增加**回读校验**：`ida_hexrays.rename_lvar()` 会返回成功但名字没落库
+  （实测：形参改名回退报 ok，重启后仍是旧名；有时还顺带把形参改成 `xxx_1`），
+  现在重新反编译确认新名字存在，否则明确报错。
+- `type_apply_batch` 的 `Unknown kind: ...` 错误补上可用取值与"可省略 kind 自动识别"的提示。
+
+### Broker 自愈
+
+`ensure_local_broker()` 只在 MCP 服务端**启动时**调用一次；Broker 中途挂掉后，本会话
+所有工具都会静默失败，`instance_list` 还会把"Broker 不可达"误报成"没有活动实例"。
+现在新增 `BrokerClient.ping()` 与 `manager.ensure_broker_available()`：每次路由前探活，
+不可达则按需后台拉起并重试；确实不可达时给出"Broker 未运行 + 日志路径 + 手动启动命令"。
+
+### 实测记录（真实 IDB：11208 函数 / 74324 xrefs）
+
+写入工具逐项验证并**逐项还原**：`rename`(函数/全局/局部/栈/批量+`dry_run`)、
+`set_comments`/`append_comments`、`patch`/`patch_asm`/`put_int`、`define_code`/`define_func`/
+`undefine`（往返后字节与原始基线完全一致）、`declare_type`/`enum_upsert`/`declare_stack`/
+`delete_stack`/`set_type`/`type_apply_batch`/`infer_types`。
+另确认 `py_eval`、`dbg_*` **未暴露**到 MCP 工具面（安全正面结论）。
+
+### 测试 383 → 402
+
+- `tests/test_cache_intercept.py`（12 项）：拦截规则（哪些请求必须转给 IDA）、
+  嵌套/扁平参数归一化、以及"打真实缓存"的过滤+分页生效用例。
+- `tests/test_incident_regressions.py` +13 项：主线程心跳闸的完整边界
+  （新鲜/过期/从未心跳/门控本身关闭/构建回调确实拿到带心跳的门控）。
+
 ## 2.1.3
 
 主题：**按"事故类别"补齐边界防护** —— 前三次卡死（保存卡死、启动卡死 ×2）都是生产事故，

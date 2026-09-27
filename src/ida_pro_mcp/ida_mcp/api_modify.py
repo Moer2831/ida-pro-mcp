@@ -31,8 +31,9 @@ from .utils import (
 )
 
 
-class CommentResult(TypedDict):
+class CommentResult(TypedDict, total=False):
     addr: str
+    applied: list[str]
     error: NotRequired[str]
 
 
@@ -96,6 +97,25 @@ class DefineResult(TypedDict, total=False):
 # ============================================================================
 
 
+def _lvar_name_exists(func_ea: int, name: str) -> bool:
+    """反编译后回读，确认局部变量名真的存在（用于校验 rename_lvar 是否落库）。
+
+    实测坑：`ida_hexrays.rename_lvar()` 返回 True 但名字没落到数据库 ——
+    形参改名回退时报告 ok，重启 IDB 后仍是旧名；有时还会把形参一起改名成 `xxx_1`。
+    所以调用方必须回读校验，把"报 ok 但没改"变成显式错误。
+    """
+    try:
+        cfunc = ida_hexrays.decompile(func_ea)
+    except Exception:  # noqa: BLE001 - 反编译失败即视为未生效
+        return False
+    if cfunc is None:
+        return False
+    try:
+        return any(getattr(lv, "name", "") == name for lv in cfunc.get_lvars())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @tool
 @idasync
 def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
@@ -115,25 +135,30 @@ def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
                 results.append(
                     {
                         "addr": addr_str,
+                        "applied": [],
                         "error": f"Failed to set disassembly comment at {hex(ea)}",
                     }
                 )
                 continue
 
+            # 反汇编注释已经写进去了。后面给反编译器视图加注释可能失败（例如该地址
+            # 没有可用的 treeloc），**不能因此报"失败"** —— 实测 AI 收到 error 会
+            # 以为整条注释没生效，从而反复重试甚至改用 patch。所以这里显式回报
+            # `applied`，让"部分成功"是可判定的。
             if not ida_hexrays.init_hexrays_plugin():
-                results.append({"addr": addr_str})
+                results.append({"addr": addr_str, "applied": ["disasm"]})
                 continue
 
             try:
                 cfunc = decompile_checked(ea)
             except IDAError:
-                results.append({"addr": addr_str})
+                results.append({"addr": addr_str, "applied": ["disasm"]})
                 continue
 
             if ea == cfunc.entry_ea:
                 idc.set_func_cmt(ea, comment, True)
                 cfunc.refresh_func_ctext()
-                results.append({"addr": addr_str})
+                results.append({"addr": addr_str, "applied": ["disasm", "func"]})
                 continue
 
             eamap = cfunc.get_eamap()
@@ -141,7 +166,11 @@ def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
                 results.append(
                     {
                         "addr": addr_str,
-                        "error": f"Failed to set decompiler comment at {hex(ea)}",
+                        "applied": ["disasm"],
+                        "error": (
+                            f"已写入反汇编注释，但该地址不在反编译映射中，"
+                            f"反编译器视图未能同步 ({hex(ea)})"
+                        ),
                     }
                 )
                 continue
@@ -159,7 +188,7 @@ def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
                 cfunc.save_user_cmts()
                 cfunc.refresh_func_ctext()
                 if not cfunc.has_orphan_cmts():
-                    results.append({"addr": addr_str})
+                    results.append({"addr": addr_str, "applied": ["disasm", "decompiler"]})
                     break
                 cfunc.del_orphan_cmts()
                 cfunc.save_user_cmts()
@@ -167,7 +196,10 @@ def set_comments(items: list[CommentOp] | CommentOp) -> list[CommentResult]:
                 results.append(
                     {
                         "addr": addr_str,
-                        "error": f"Failed to set decompiler comment at {hex(ea)}",
+                        "applied": ["disasm"],
+                        "error": (
+                            f"已写入反汇编注释，但反编译器视图未能安放注释 ({hex(ea)})"
+                        ),
                     }
                 )
         except Exception as e:
@@ -570,8 +602,19 @@ def rename(
                 if not dry_run:
                     success = ida_hexrays.rename_lvar(func.start_ea, old_name, new_name)
                     if success:
-                        refresh_decompiler_ctext(func.start_ea)
-                if not success:
+                        # 回读校验：`rename_lvar()` 会返回成功但名字没落库（实测：
+                        # 形参改名回退报告 ok，重启 IDB 后仍是旧名；有时还会顺带把
+                        # 形参一起改名出 `xxx_1`）。工具报 ok 而实际没改比报错更糟，
+                        # 所以这里必须重新反编译确认新名字真的存在。
+                        success = _lvar_name_exists(func.start_ea, new_name)
+                        if not success:
+                            error = (
+                                f"rename_lvar 返回成功但回读未找到新名字 {new_name!r}"
+                                "（改动未落库，请确认 old 名字是否准确）"
+                            )
+                        else:
+                            refresh_decompiler_ctext(func.start_ea)
+                if not success and error is None:
                     error = "Rename failed"
 
                 result = {
