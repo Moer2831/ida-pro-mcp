@@ -12,6 +12,27 @@
 
 ---
 
+## 快速开始（GUI IDA + 任意 MCP 客户端）
+
+```text
+① 装到本机 Python 环境    pip install -e .                 （见"三、安装"）
+② 部署 IDA 插件           见"三、安装 → 部署 / 更新插件"   （Windows 必须手动铺一次）
+③ 配置 MCP 客户端         见"七、使用方式"                 （DSH / Cursor / Claude 各有配方）
+④ 打开 IDA 加载二进制     插件自动连 Broker，缓存自动开始构建（不需要按 Ctrl+Alt+M）
+⑤ 在客户端里调用工具      mcp__ida__decompile / list_funcs / find_regex / cache_status ...
+```
+
+三个最容易踩的坑，先记住：
+
+1. **IDA 只扫描自己的插件目录**（`%APPDATA%\Hex-Rays\IDA Pro\plugins`），仓库目录它不认识；
+   改了仓库代码**必须重新部署**，否则 IDA 跑的还是旧拷贝（这是"改了没生效"的头号原因）。
+2. **Broker 由 MCP 客户端启动**：客户端以 stdio 启动 `ida-pro-mcp` 时会在回环地址自动拉起 Broker，
+   IDA 插件只负责注册与退避重连；没有客户端时请在终端手动 `ida-pro-mcp --broker`。
+3. **用 Output 窗口确认版本**：出现 `[MCP] 插件代码: ... (缓存 schema v2)` 与
+   带配置后缀的 `[MCP][cache] 守护线程启动 ... (scope=..., chunk=...)` 才算新版生效。
+
+---
+
 ## 一、项目亮点（本增强版 vs. 上游）
 
 - **Broker 进程纯路由**：独立监听 `127.0.0.1:13337`，IDA 实例与所有 MCP 客户端都只和它交互；多 Cursor 窗口、多 IDA 同时挂载不再抢端口。
@@ -30,7 +51,7 @@
 
 - Python 3.11+（建议使用 `idapyswitch` 切换到最新 Python）
 - IDA Pro 8.3+（推荐 9.0+），**不支持 IDA Free**
-- 支持任意标准 MCP 客户端：Cursor / Claude / Claude Code / Codex / VS Code / Gemini CLI / Cline 等
+- 支持任意标准 MCP 客户端：DSH（DeepSeek Harness）/ Cursor / Claude / Claude Code / Codex / VS Code / Gemini CLI / Cline 等
 
 ---
 
@@ -54,6 +75,30 @@ ida-pro-mcp --install
 ```
 
 安装完成后请**完全重启** IDA 和 MCP 客户端。某些客户端（如 Claude Desktop）在后台常驻，需要从托盘图标退出。IDA 插件菜单需要先加载一个二进制文件才会出现。
+
+### 部署 / 更新 IDA 插件（Windows）
+
+IDA 只扫描两个插件目录，仓库目录它不认识：
+
+- `<IDADIR>\plugins`（系统级）
+- `%APPDATA%\Hex-Rays\IDA Pro\plugins`（用户级，免管理员）
+
+`ida-pro-mcp --install` 会优先创建符号链接，失败则退化为**拷贝**（Windows 默认没有符号链接权限）。
+因此**改了仓库代码必须重新部署**，否则 IDA 加载的仍是旧拷贝 —— 典型症状是"缓存还在用老实现 / 没有新增功能"。
+
+```powershell
+# 1) 完全退出 IDA（含 ida64 / idat64）
+# 2) 删掉旧插件
+$dep = "$env:APPDATA\Hex-Rays\IDA Pro\plugins"
+Remove-Item "$dep\ida_mcp.py","$dep\ida_mcp","$dep\broker" -Recurse -Force -ErrorAction SilentlyContinue
+# 3) 从仓库拷贝新版（把 $repo 换成你的克隆路径）
+$repo = 'D:\path\to\ida-pro-mcp\src\ida_pro_mcp'
+Copy-Item "$repo\ida_mcp.py" "$dep\ida_mcp.py" -Force
+Copy-Item "$repo\ida_mcp","$repo\broker" $dep -Recurse -Force
+# 4) 重新打开 IDA：Output 首行应出现  [MCP] 插件代码: ... (缓存 schema v2)
+```
+
+等价做法（会同时刷新 MCP 客户端配置）：`ida-pro-mcp --install`。
 
 ---
 
@@ -186,21 +231,47 @@ stateDiagram-v2
 
 ## 七、使用方式（Broker 模式）
 
-多窗口 Cursor、多个 IDA 实例并用时，请务必**先启动 Broker**，再启动客户端。
+多个 IDA 实例、多个客户端窗口并用时，它们共享同一个 Broker（每个 IDA 用 `instance_id` 注册，互不抢端口）。
+Broker 由**客户端进程**自动拉起，也可以手动常开：
 
-> 本仓库的 stdio 入口已内置 Broker 自动拉起：客户端启动本进程时会检测回环地址上的 Broker，没有就自动起一个（见"项目亮点"）。因此下面第 1 步现在是**可选**的；想固定用一个自己掌控的 Broker（例如自定义端口或远程地址），仍建议手动先启动。
+> **现状说明**：Broker 没有空闲自动退出 —— IDA 全部关闭后它仍会驻留，下次客户端启动直接复用（不会反复重启）。
+> 插件本身**不会**拉起 Broker，它只负责注册与退避重连。
 
 ```bash
-# 1. 先启动 Broker（保持一个终端常开）
+# 1. 启动 Broker（可选：客户端启动时会自动拉起本机 Broker）
 uv run ida-pro-mcp --broker
 # 或自定义端口
 uv run ida-pro-mcp --broker --port 13337
 
-# 2. 启动 Cursor/Claude/VS Code 等，它们会通过 stdio 启动
-#    自己的 ida-pro-mcp 进程，并向上面的 Broker 发请求
+# 2. 启动 MCP 客户端（Cursor / Claude / VS Code / DSH…），它们会通过 stdio
+#    启动自己的 ida-pro-mcp 进程，并向上面的 Broker 发请求
 
-# 3. 打开 IDA、加载二进制，按 Ctrl+Alt+M 连接到 Broker
+# 3. 打开 IDA、加载二进制 —— 插件会自动注册并开始建缓存
+#    （只有自动连接失败时才需要按 Ctrl+Alt+M 手动重连）
 ```
+
+### 在 DSH（DeepSeek Harness）中配置
+
+DSH 用 `@deepseek-ai/dsh-mcp-client` 把外部 MCP 服务器桥接成原生工具，工具名形如
+`mcp__<serverName>__<tool>`。在 profile 的补丁层 `$DSH_HOME/profiles/<profile>/cordis.patch.yml`
+里**必须用 `insert:` 包一层** —— 顶层直接写 `- id: ...` 会被当成"覆盖一个不存在的行"而被忽略
+（`dsh --dump-config` 会打印 `patch: entry "..." not found`）：
+
+```yaml
+- insert:
+    - id: mcp-ida
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: ida
+        transport: stdio
+        command: 'D:\path\to\ida-pro-mcp\.venv\Scripts\ida-pro-mcp.exe'
+```
+
+- `web` profile 是 `patchReload: live`：保存即生效，**不需要重启 DSH**。
+- 配好后模型侧会出现 `mcp__ida__decompile`、`mcp__ida__list_funcs`、`mcp__ida__find_regex`、
+  `mcp__ida__cache_status` 等工具（本机实测 66 个）。
+- 校验：`dsh --profile web --dump-config`（组合树里应出现 `mcp-ida` 且无 patch 警告）。
+- 临时停用：给该行加 `disabled: true`。
 
 ### 远程访问
 
@@ -516,6 +587,23 @@ worker 控制：
 ```bash
 uv pip install -e .
 ```
+
+**Q：IDA 里报 `[MCP] HTTP POST 失败 http://127.0.0.1:13337/register: <urlopen error [WinError 10061]>`？**
+
+10061 = 连接被拒绝，即**本机此刻没有 Broker 在监听**，属于预期提示（不是插件故障）：
+
+- 启动 MCP 客户端（DSH / Cursor / Claude…）后它会自动拉起 Broker，插件会指数退避自动重连；
+- 或者手动常开一个：`ida-pro-mcp --broker`；
+- 确认是否在跑：`Get-NetTCPConnection -LocalPort 13337 -State Listen`（日志见 `~/.ida-pro-mcp/broker-<port>.log`）。
+
+**Q：缓存报 `status=error, reason=Function can be called from the main thread only`？**
+
+这是 2.1.0 之前的插件在 IDB 装载早期用 `is_idaq()` 误判"是否需要派发到主线程"导致的。
+先确认 IDA 加载的是新版（Output 首行 `[MCP] 插件代码: ... (缓存 schema v2)`），否则按"三、安装 → 部署 / 更新 IDA 插件"重新铺一次。
+
+**Q：改了仓库代码，但 IDA 行为没变？**
+
+插件是**拷贝**部署到 `%APPDATA%\Hex-Rays\IDA Pro\plugins` 的，重新部署并重启 IDA 才会生效（同理，`schema v2` 这行是判断依据）。
 
 ---
 
