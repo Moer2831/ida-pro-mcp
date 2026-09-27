@@ -8,13 +8,26 @@ import json
 import queue
 import socketserver
 import threading
+import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Callable, Optional
 from urllib.parse import parse_qs, urlparse
 import sys
+
+# 已超时/已断开请求的 request_id 记忆上限：用于区分"迟到响应"与"未知响应"，
+# 同时保证这个集合有界（否则长期运行会内存泄漏）。
+MAX_EXPIRED_REQUEST_IDS = 256
+
+# _pending 条目超过 deadline 后仍未被等待线程回收时的宽限期（秒）。
+# 正常路径下等待线程一定会在 deadline 时自行 pop，这里只兜底异常挂死的线程。
+PENDING_PRUNE_GRACE_SEC = 60.0
+
+# 已断开实例的指标保留数量上限（有界历史，便于排查"刚断开的实例"）。
+MAX_RETIRED_INSTANCE_STATS = 16
 
 
 @dataclass
@@ -47,6 +60,78 @@ class IDAInstance:
         return result
 
 
+@dataclass
+class BrokerMetrics:
+    """Broker 路由指标（读写都在 IDARegistry._lock 保护下）
+
+    计数口径（互斥的终态桶）:
+      requests_routed == requests_completed + requests_failed + requests_timed_out
+      - requests_routed: 进入路由的请求总数（含未找到实例等提前失败）
+      - requests_completed: 拿到非 error 响应的请求数
+      - requests_failed: 路由失败 / 响应带 error / 空响应
+      - requests_timed_out: 等待 IDA 响应超时
+      - requests_in_flight: 当前仍在等待响应的请求数
+    """
+
+    requests_routed: int = 0
+    requests_in_flight: int = 0
+    requests_completed: int = 0
+    requests_failed: int = 0
+    requests_timed_out: int = 0
+    requests_rejected: int = 0
+    responses_accepted: int = 0
+    late_responses_discarded: int = 0
+    unknown_responses_discarded: int = 0
+    pending_pruned: int = 0
+    pending_orphaned_on_disconnect: int = 0
+    instance_disconnects: int = 0
+    last_error: Optional[str] = None
+    last_error_at: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "requests_routed": self.requests_routed,
+            "requests_in_flight": self.requests_in_flight,
+            "requests_completed": self.requests_completed,
+            "requests_failed": self.requests_failed,
+            "requests_timed_out": self.requests_timed_out,
+            "requests_rejected": self.requests_rejected,
+            "responses_accepted": self.responses_accepted,
+            "late_responses_discarded": self.late_responses_discarded,
+            "unknown_responses_discarded": self.unknown_responses_discarded,
+            "pending_pruned": self.pending_pruned,
+            "pending_orphaned_on_disconnect": self.pending_orphaned_on_disconnect,
+            "instance_disconnects": self.instance_disconnects,
+            "last_error": self.last_error,
+            "last_error_at": self.last_error_at,
+        }
+
+
+@dataclass
+class InstanceStats:
+    """单个 IDA 实例的请求侧统计"""
+
+    requests_sent: int = 0
+    responses_received: int = 0
+    timeouts: int = 0
+    last_seen: Optional[datetime] = None
+    last_seen_reason: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "requests_sent": self.requests_sent,
+            "responses_received": self.responses_received,
+            "timeouts": self.timeouts,
+            "last_seen": self.last_seen.isoformat() if self.last_seen else None,
+            "last_seen_age_sec": (
+                round((datetime.now() - self.last_seen).total_seconds(), 3)
+                if self.last_seen
+                else None
+            ),
+            "last_seen_reason": self.last_seen_reason,
+        }
+
+
 class IDARegistry:
     """IDA 实例注册表"""
     
@@ -57,8 +142,20 @@ class IDARegistry:
         # SSE 队列：client_id -> Queue
         self._sse_queues: dict[str, queue.Queue] = {}
         
-        # 待响应请求：request_id -> {event, response}
+        # 待响应请求：request_id -> {event, response, client_id, deadline}
         self._pending: dict[str, dict] = {}
+
+        # 已终结（超时/断开）请求的 request_id 记忆：request_id -> 记录时间(monotonic)
+        self._expired_pending: "OrderedDict[str, float]" = OrderedDict()
+
+        # 指标
+        self._metrics = BrokerMetrics()
+        self._instance_stats: dict[str, InstanceStats] = {}
+        self._retired_instance_stats: "OrderedDict[str, tuple[IDAInstance, InstanceStats]]" = (
+            OrderedDict()
+        )
+        self._started_at = datetime.now()
+        self._started_monotonic = time.monotonic()
         
         # 回调
         self._on_connect: Optional[Callable[[IDAInstance], None]] = None
@@ -71,6 +168,7 @@ class IDARegistry:
             # 同 instance_id 已存在则先移除旧连接（重连或重复点击导致）
             for old_client_id, old_inst in list(self._instances.items()):
                 if old_inst.instance_id == instance_id:
+                    self._retire_instance_stats_locked(old_client_id, old_inst)
                     self._instances.pop(old_client_id, None)
                     self._sse_queues.pop(old_client_id, None)
                     print(f"[HTTP] 替换旧连接: {old_inst.name or instance_id} ({old_client_id})", file=sys.stderr)
@@ -92,6 +190,8 @@ class IDARegistry:
             )
             self._instances[client_id] = instance
             self._sse_queues[client_id] = queue.Queue()
+            self._instance_stats[client_id] = InstanceStats()
+            self._note_instance_activity_locked(client_id, "register")
 
             print(f"[HTTP] +++ IDA 已连接: {instance.name or instance.instance_id} +++", file=sys.stderr)
             sys.stderr.flush()
@@ -106,8 +206,24 @@ class IDARegistry:
         with self._lock:
             instance = self._instances.pop(client_id, None)
             self._sse_queues.pop(client_id, None)
-            
+            self._retire_instance_stats_locked(client_id, instance)
+
             if instance:
+                # 断开时仍有请求在等待：记录并标记为"已终结"，避免它们被误判为未知响应
+                orphaned = [
+                    request_id
+                    for request_id, entry in self._pending.items()
+                    if entry.get("client_id") == client_id
+                ]
+                for request_id in orphaned:
+                    self._remember_expired_request_locked(request_id)
+                if orphaned:
+                    self._metrics.pending_orphaned_on_disconnect += len(orphaned)
+                    self._record_error_locked(
+                        f"实例 {instance.instance_id} 断开时仍有 {len(orphaned)} 个请求等待响应"
+                    )
+                self._metrics.instance_disconnects += 1
+
                 print(f"[HTTP] --- IDA 已断开: {instance.name or instance.instance_id} ---", file=sys.stderr)
                 sys.stderr.flush()
                 
@@ -136,60 +252,258 @@ class IDARegistry:
         """是否有实例"""
         with self._lock:
             return len(self._instances) > 0
-    
+
+    # ------------------------------------------------------------------
+    # 指标
+    # ------------------------------------------------------------------
+
+    def _record_error_locked(self, message: str) -> None:
+        """记录最近一次错误（供 /status 的 metrics 观察，不抛异常）。"""
+        self._metrics.last_error = message
+        self._metrics.last_error_at = datetime.now().isoformat()
+
+    def _metrics_fail_locked(self, message: str) -> None:
+        """记录一次路由失败（终态：failed）。"""
+        self._metrics.requests_failed += 1
+        self._record_error_locked(message)
+
+    def _finish_request_locked(self, response: Optional[dict]) -> None:
+        """记录一次请求的终态（completed / failed，二者互斥）。"""
+        if response is None:
+            self._metrics.requests_failed += 1
+            self._record_error_locked("IDA 返回空响应")
+            return
+        if isinstance(response, dict) and response.get("error"):
+            self._metrics.requests_failed += 1
+            error = response.get("error")
+            if isinstance(error, dict):
+                self._record_error_locked(str(error.get("message", error)))
+            else:
+                self._record_error_locked(str(error))
+            return
+        self._metrics.requests_completed += 1
+
+    def note_rejected_request(self, message: str) -> None:
+        """记录在任何路由发生前就被拒绝的请求（例如没有任何 IDA 实例）。"""
+        with self._lock:
+            self._metrics.requests_routed += 1
+            self._metrics.requests_rejected += 1
+            self._metrics_fail_locked(message)
+
+    def _note_instance_activity_locked(self, client_id: str, reason: str) -> None:
+        """刷新实例的 last_seen（注册/发请求/收响应）。"""
+        stats = self._instance_stats.get(client_id)
+        if stats is None:
+            return
+        stats.last_seen = datetime.now()
+        stats.last_seen_reason = reason
+
+    def _retire_instance_stats_locked(
+        self, client_id: str, instance: Optional[IDAInstance] = None
+    ) -> None:
+        """实例下线：指标移入有界历史，避免统计字典无限增长。"""
+        stats = self._instance_stats.pop(client_id, None)
+        if stats is None:
+            return
+        if instance is None:
+            instance = self._instances.get(client_id)
+        if instance is None:
+            return
+        self._retired_instance_stats[client_id] = (instance, stats)
+        self._retired_instance_stats.move_to_end(client_id)
+        while len(self._retired_instance_stats) > MAX_RETIRED_INSTANCE_STATS:
+            self._retired_instance_stats.popitem(last=False)
+
+    def metrics_snapshot(self) -> dict:
+        """返回 /status 用的指标快照（线程安全）。"""
+        with self._lock:
+            instances: dict[str, dict] = {}
+            for client_id, instance in self._instances.items():
+                instances[client_id] = self._instance_metrics_locked(
+                    client_id, instance, self._instance_stats.get(client_id), connected=True
+                )
+            for client_id, (instance, stats) in self._retired_instance_stats.items():
+                instances[client_id] = self._instance_metrics_locked(
+                    client_id, instance, stats, connected=False
+                )
+
+            snapshot = self._metrics.to_dict()
+            snapshot.update(
+                {
+                    "pending_requests": len(self._pending),
+                    "expired_requests_tracked": len(self._expired_pending),
+                    "pending_prune_grace_sec": PENDING_PRUNE_GRACE_SEC,
+                    "instances": instances,
+                    "instances_connected": len(self._instances),
+                    "instances_retired": len(self._retired_instance_stats),
+                    "queue_depth_total": sum(
+                        self._queue_depth_locked(client_id) for client_id in self._sse_queues
+                    ),
+                    "started_at": self._started_at.isoformat(),
+                    "uptime_sec": round(time.monotonic() - self._started_monotonic, 3),
+                }
+            )
+            return snapshot
+
+    def _queue_depth_locked(self, client_id: str) -> int:
+        sse_queue = self._sse_queues.get(client_id)
+        if sse_queue is None:
+            return 0
+        try:
+            return int(sse_queue.qsize())
+        except Exception as exc:
+            # 仅影响指标展示，不吞掉原因
+            print(f"[HTTP] 读取队列深度失败 ({client_id}): {exc}", file=sys.stderr)
+            sys.stderr.flush()
+            return 0
+
+    def _instance_metrics_locked(
+        self,
+        client_id: str,
+        instance: IDAInstance,
+        stats: Optional[InstanceStats],
+        *,
+        connected: bool,
+    ) -> dict:
+        payload = {
+            "instance_id": instance.instance_id,
+            "name": instance.name,
+            "connected": connected,
+            "queue_depth": self._queue_depth_locked(client_id) if connected else 0,
+            "connected_at": instance.connected_at.isoformat(),
+        }
+        payload.update((stats or InstanceStats()).to_dict())
+        return payload
+
+    def _remember_expired_request_locked(self, request_id: str) -> None:
+        """记住已终结的 request_id（有界），用于识别迟到响应。"""
+        self._expired_pending[request_id] = time.monotonic()
+        self._expired_pending.move_to_end(request_id)
+        while len(self._expired_pending) > MAX_EXPIRED_REQUEST_IDS:
+            self._expired_pending.popitem(last=False)
+
+    def _prune_stale_pending_locked(self) -> None:
+        """兜底清理：等待线程异常消失时，_pending 条目不会永久残留。"""
+        now = time.monotonic()
+        stale = [
+            request_id
+            for request_id, entry in self._pending.items()
+            if now > float(entry.get("deadline", now)) + PENDING_PRUNE_GRACE_SEC
+        ]
+        for request_id in stale:
+            self._pending.pop(request_id, None)
+            self._remember_expired_request_locked(request_id)
+            self._metrics.pending_pruned += 1
+            print(f"[HTTP] 清理超时未回收的 pending 请求: {request_id}", file=sys.stderr)
+            sys.stderr.flush()
+
     def send_request(self, request: dict, instance_id: Optional[str] = None, timeout: float = 60.0) -> Optional[dict]:
         """发送请求到 IDA 并等待响应"""
         with self._lock:
-            # 确定目标实例
-            if instance_id:
-                inst = self.get_by_instance_id(instance_id)
-            else:
-                # 如果未指定且只有一个实例，自动路由；否则报错返回
-                if len(self._instances) == 1:
-                    inst = next(iter(self._instances.values()))
+            self._metrics.requests_routed += 1
+            self._metrics.requests_in_flight += 1
+        try:
+            with self._lock:
+                self._prune_stale_pending_locked()
+                # 确定目标实例
+                if instance_id:
+                    inst = self.get_by_instance_id(instance_id)
                 else:
+                    # 如果未指定且只有一个实例，自动路由；否则报错返回
+                    if len(self._instances) == 1:
+                        inst = next(iter(self._instances.values()))
+                    else:
+                        message = "存在多个 IDA 实例或未指定 instance_id，无法路由。"
+                        self._metrics_fail_locked(message)
+                        return {
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32602, "message": message},
+                            "id": request.get("id")
+                        }
+                
+                if not inst:
+                    message = f"找不到目标实例: {instance_id}"
+                    self._metrics_fail_locked(message)
                     return {
                         "jsonrpc": "2.0",
-                        "error": {"code": -32602, "message": "存在多个 IDA 实例或未指定 instance_id，无法路由。"},
+                        "error": {"code": -32000, "message": message},
                         "id": request.get("id")
                     }
-            
-            if not inst:
-                return {
-                    "jsonrpc": "2.0",
-                    "error": {"code": -32000, "message": f"找不到目标实例: {instance_id}"},
-                    "id": request.get("id")
+                
+                client_id = inst.client_id
+                sse_queue = self._sse_queues.get(client_id)
+                if not sse_queue:
+                    self._metrics_fail_locked(f"实例 {instance.instance_id} 没有可用的 SSE 队列")
+                    return None
+                
+                # 创建请求跟踪
+                request_id = str(uuid.uuid4())[:8]
+                event = threading.Event()
+                self._pending[request_id] = {
+                    "event": event,
+                    "response": None,
+                    "client_id": client_id,
+                    "deadline": time.monotonic() + max(0.0, float(timeout)),
                 }
+                stats = self._instance_stats.get(client_id)
+                if stats is not None:
+                    stats.requests_sent += 1
+                self._note_instance_activity_locked(client_id, "request")
             
-            client_id = inst.client_id
-            sse_queue = self._sse_queues.get(client_id)
-            if not sse_queue:
+            # 放入 SSE 队列
+            sse_queue.put({"request_id": request_id, "request": request})
+            
+            # 等待响应
+            if event.wait(timeout):
+                with self._lock:
+                    result = self._pending.pop(request_id, {})
+                    response = result.get("response")
+                    self._finish_request_locked(response)
+                    return response
+            else:
+                with self._lock:
+                    self._pending.pop(request_id, None)
+                    self._remember_expired_request_locked(request_id)
+                    self._metrics.requests_timed_out += 1
+                    self._record_error_locked("IDA 请求超时")
+                    stats = self._instance_stats.get(client_id)
+                    if stats is not None:
+                        stats.timeouts += 1
                 return None
-            
-            # 创建请求跟踪
-            request_id = str(uuid.uuid4())[:8]
-            event = threading.Event()
-            self._pending[request_id] = {"event": event, "response": None}
-        
-        # 放入 SSE 队列
-        sse_queue.put({"request_id": request_id, "request": request})
-        
-        # 等待响应
-        if event.wait(timeout):
+        finally:
+            # 任何退出路径都必须归还 in-flight 计数（含异常路径）
             with self._lock:
-                result = self._pending.pop(request_id, {})
-                return result.get("response")
-        else:
-            with self._lock:
-                self._pending.pop(request_id, None)
-            return None
-    
+                self._metrics.requests_in_flight = max(
+                    0, self._metrics.requests_in_flight - 1
+                )
+
     def set_response(self, request_id: str, response: dict):
-        """设置请求响应"""
+        """设置请求响应；迟到/未知响应安全丢弃并计入指标。"""
         with self._lock:
-            if request_id in self._pending:
-                self._pending[request_id]["response"] = response
-                self._pending[request_id]["event"].set()
+            entry = self._pending.get(request_id)
+            if entry is not None:
+                entry["response"] = response
+                client_id = entry.get("client_id")
+                if client_id:
+                    stats = self._instance_stats.get(client_id)
+                    if stats is not None:
+                        stats.responses_received += 1
+                    self._note_instance_activity_locked(client_id, "response")
+                self._metrics.responses_accepted += 1
+                entry["event"].set()
+                return
+
+            if request_id in self._expired_pending:
+                # 请求已超时/实例已断开：响应迟到，安全丢弃，不能影响在途计数
+                del self._expired_pending[request_id]
+                self._metrics.late_responses_discarded += 1
+                print(f"[HTTP] 丢弃迟到响应: {request_id}", file=sys.stderr)
+                sys.stderr.flush()
+                return
+
+            self._metrics.unknown_responses_discarded += 1
+            print(f"[HTTP] 丢弃未知响应: {request_id}", file=sys.stderr)
+            sys.stderr.flush()
     
     def get_sse_queue(self, client_id: str) -> Optional[queue.Queue]:
         """获取 SSE 队列"""
@@ -266,7 +580,11 @@ class IDARequestHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"error": "Missing client_id"}, 400)
         elif path == "/status":
-            self._send_json({"instances": REGISTRY.list_all()})
+            # 新增 "metrics" 键（纯增量）；"instances" 键保持原样以兼容前端
+            self._send_json({
+                "instances": REGISTRY.list_all(),
+                "metrics": REGISTRY.metrics_snapshot(),
+            })
         elif path == "/api/instances":
             self._send_json(REGISTRY.list_all())
         else:
@@ -328,8 +646,10 @@ class IDARequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Missing request"}, 400)
             return
         if not REGISTRY.has_instances():
+            message = "没有活动的 IDA 实例。请启动 IDA 并按 Ctrl+Alt+M 连接。"
+            REGISTRY.note_rejected_request(message)
             self._send_json({
-                "error": "没有活动的 IDA 实例。请启动 IDA 并按 Ctrl+Alt+M 连接。",
+                "error": message,
                 "response": None,
             })
             return

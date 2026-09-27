@@ -56,7 +56,7 @@ class CombinedRequestHandler(McpHttpRequestHandler):
             payload = (
                 REGISTRY.list_all()
                 if path == "/api/instances"
-                else {"instances": REGISTRY.list_all()}
+                else {"instances": REGISTRY.list_all(), "metrics": REGISTRY.metrics_snapshot()}
             )
             self._broker_json(payload)
             return
@@ -120,9 +120,11 @@ class CombinedRequestHandler(McpHttpRequestHandler):
                 self._broker_json({"error": "Missing request"}, 400)
                 return
             if not REGISTRY.has_instances():
+                message = "没有活动的 IDA 实例。请启动 IDA 并按 Ctrl+Alt+M 连接。"
+                REGISTRY.note_rejected_request(message)
                 self._broker_json(
                     {
-                        "error": "没有活动的 IDA 实例。请启动 IDA 并按 Ctrl+Alt+M 连接。",
+                        "error": message,
                         "response": None,
                     }
                 )

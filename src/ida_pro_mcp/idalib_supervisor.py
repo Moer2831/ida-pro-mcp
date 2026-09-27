@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 STDIO_DEFAULT_CONTEXT_ID = "stdio:default"
 SHARED_FALLBACK_CONTEXT_ID = "shared:fallback"
+IDLE_TTL_ENV = "IDA_MCP_IDLE_TTL_SEC"
+IDLE_SWEEP_ENV = "IDA_MCP_IDLE_SWEEP_SEC"
+DEFAULT_IDLE_TTL_SEC = 0.0
+DEFAULT_IDLE_SWEEP_SEC = 30.0
+MIN_IDLE_SWEEP_SEC = 1.0
 _DATABASE_ARG = "database"
 _DATABASE_ARG_SCHEMA = {
     "type": "string",
@@ -68,6 +73,18 @@ def _import_zeromcp():
 
 
 McpServer = _import_zeromcp()
+
+
+def _env_float(name: str, default: float) -> float:
+    """读取浮点型环境变量，非法值回退默认值。"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("%s=%r 不是合法数字，回退默认值 %s", name, raw, default)
+        return default
 
 
 def _import_discovery():
@@ -230,11 +247,16 @@ class IdalibSupervisor:
         isolated_contexts: bool = False,
         max_workers: int = 4,
         worker_args: list[str] | None = None,
+        idle_ttl_sec: float | None = None,
+        idle_sweep_sec: float | None = None,
     ):
         self.mcp = mcp
         self.isolated_contexts = isolated_contexts
         self.max_workers = max_workers
         self.worker_args = worker_args or []
+        # 空闲回收配置：由 worker 进程的 session manager 读取环境变量生效
+        self.idle_ttl_sec = idle_ttl_sec
+        self.idle_sweep_sec = idle_sweep_sec
         self.sessions: dict[str, WorkerSession] = {}
         self.path_to_session: dict[str, str] = {}
         self.context_bindings: dict[str, str] = {}
@@ -280,6 +302,21 @@ class IdalibSupervisor:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
+    def _worker_env(self) -> dict[str, str] | None:
+        """worker 进程环境：把空闲回收配置透传给 idalib worker。
+
+        worker 里的 session manager 通过 `IDA_MCP_IDLE_TTL_SEC` /
+        `IDA_MCP_IDLE_SWEEP_SEC` 读取；未显式配置时返回 None（继承父进程环境）。
+        """
+        if self.idle_ttl_sec is None and self.idle_sweep_sec is None:
+            return None
+        env = dict(os.environ)
+        if self.idle_ttl_sec is not None:
+            env[IDLE_TTL_ENV] = repr(max(0.0, float(self.idle_ttl_sec)))
+        if self.idle_sweep_sec is not None:
+            env[IDLE_SWEEP_ENV] = repr(max(MIN_IDLE_SWEEP_SEC, float(self.idle_sweep_sec)))
+        return env
+
     def _spawn_worker(self) -> WorkerSession:
         port = self._pick_port()
         cmd = [
@@ -298,6 +335,7 @@ class IdalibSupervisor:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=self._worker_env(),
         )
         worker = WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
@@ -1243,7 +1281,8 @@ def dispatch_supervisor(request: dict | str | bytes | bytearray) -> dict | None:
     return _require_supervisor().forward_raw(session, request_obj)
 
 
-def main() -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """构建 idalib-mcp 命令行解析器（独立函数便于测试）。"""
     parser = argparse.ArgumentParser(description="MCP supervisor for IDA Pro via idalib")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show debug messages")
     parser.add_argument("--stdio", action="store_true", help="Serve MCP over stdio instead of HTTP")
@@ -1268,8 +1307,33 @@ def main() -> None:
         default=int(os.environ.get("IDA_MCP_MAX_WORKERS", "4")),
         help="Maximum simultaneous idalib worker databases (0 = unlimited, default: 4).",
     )
+    parser.add_argument(
+        "--idle-ttl",
+        type=float,
+        default=_env_float(IDLE_TTL_ENV, DEFAULT_IDLE_TTL_SEC),
+        metavar="SEC",
+        help=(
+            "Close worker databases idle longer than SEC seconds "
+            f"(env {IDLE_TTL_ENV}, 0 = disabled, default: {DEFAULT_IDLE_TTL_SEC:g})."
+        ),
+    )
+    parser.add_argument(
+        "--idle-sweep",
+        type=float,
+        default=_env_float(IDLE_SWEEP_ENV, DEFAULT_IDLE_SWEEP_SEC),
+        metavar="SEC",
+        help=(
+            "Idle reaper sweep interval in seconds "
+            f"(env {IDLE_SWEEP_ENV}, minimum {MIN_IDLE_SWEEP_SEC:g}, "
+            f"default: {DEFAULT_IDLE_SWEEP_SEC:g})."
+        ),
+    )
     parser.add_argument("input_path", type=Path, nargs="?", help="Optional binary to open on startup.")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = _build_arg_parser().parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
 
@@ -1287,6 +1351,8 @@ def main() -> None:
         isolated_contexts=args.isolated_contexts,
         max_workers=args.max_workers,
         worker_args=worker_args,
+        idle_ttl_sec=args.idle_ttl,
+        idle_sweep_sec=args.idle_sweep,
     )
     mcp.registry.dispatch = dispatch_supervisor
     mcp.require_streamable_http_session = args.isolated_contexts
