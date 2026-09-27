@@ -187,6 +187,19 @@ class RefreshCacheResult(TypedDict):
     idb_path: str
 
 
+class CacheProgress(TypedDict, total=False):
+    """缓存构建进度（写侧节流写入 meta，读侧原样回传）。"""
+
+    phase: str
+    table: str
+    rows: int
+    total: int
+    elapsed_ms: float
+    peak_rss_mb: float
+    refreshing: bool
+    build_id: int
+
+
 class CacheStatusResult(TypedDict):
     exists: bool
     db_path: str
@@ -198,6 +211,14 @@ class CacheStatusResult(TypedDict):
     function_xrefs: int
     globals: int
     imports: int
+    # --- 观测性增补字段（旧客户端可安全忽略） ---
+    schema_version: NotRequired[int]
+    partial: NotRequired[bool]
+    last_error: NotRequired[str]
+    degraded_reason: NotRequired[str]
+    tables_skipped: NotRequired[list[str]]
+    counts_source: NotRequired[str]  # "meta"（O(1) 读）或 "count"（全表 COUNT）
+    progress: NotRequired[CacheProgress]
 
 
 # ---------------------------------------------------------------------------

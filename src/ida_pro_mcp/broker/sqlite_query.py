@@ -163,6 +163,55 @@ def _count(conn: sqlite3.Connection, sql: str, params: tuple) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 过滤条件编译：尽量避开逐行 Python UDF
+# ---------------------------------------------------------------------------
+
+_REGEX_METACHARS = frozenset("\\.^$*+?{}[]|()")
+
+
+def _literal_text(pattern: str) -> Optional[str]:
+    """pattern 不含正则元字符时返回其字面量，否则 None。"""
+    if not pattern or any(ch in _REGEX_METACHARS for ch in pattern):
+        return None
+    return pattern
+
+
+def _prefix_text(pattern: str) -> Optional[str]:
+    """识别 `^字面量` 形式并返回字面量部分。"""
+    if not pattern.startswith("^"):
+        return None
+    return _literal_text(pattern[1:])
+
+
+def _prefix_bounds(prefix: str) -> Optional[tuple[str, str]]:
+    """把前缀转成 BINARY 区间 [lo, hi)；无法构造时返回 None。"""
+    if not prefix:
+        return None
+    last = ord(prefix[-1])
+    if last >= 0x10FFFF:
+        return None
+    return (prefix, prefix[:-1] + chr(last + 1))
+
+
+def _text_clause(column: str, pattern: str) -> tuple[str, tuple]:
+    """把正则 pattern 编译成 SQL 条件，优先走 SQLite 原生实现。
+
+    - 纯字面量   → `instr(col, ?) > 0`：C 实现、大小写敏感，与 `re.search` 等价
+    - `^字面量`  → `col >= ? AND col < ?`：BINARY 区间，可用索引，避免全表排序
+    - 其它       → `col REGEXP ?`：保留 Python UDF，语义完整但逐行回调最慢
+    """
+    literal = _literal_text(pattern)
+    if literal is not None:
+        return (f"instr({column}, ?) > 0", (literal,))
+    prefix = _prefix_text(pattern)
+    if prefix:
+        bounds = _prefix_bounds(prefix)
+        if bounds is not None:
+            return (f"{column} >= ? AND {column} < ?", bounds)
+    return (f"{column} REGEXP ?", (pattern,))
+
+
+# ---------------------------------------------------------------------------
 # 查询函数 (公开接口)
 # ---------------------------------------------------------------------------
 
@@ -177,16 +226,22 @@ def find_regex(
 ) -> FindRegexResult:
     conn = ensure_ready(db_path)
     try:
-        total = _count(
-            conn, "SELECT COUNT(*) FROM strings WHERE text REGEXP ?", (pattern,)
-        )
-        cur = conn.execute(
-            "SELECT addr, text, length, segment FROM strings "
-            "WHERE text REGEXP ? ORDER BY ea LIMIT ? OFFSET ?",
-            (pattern, int(limit), int(offset)),
+        clause, params = _text_clause("text", pattern)
+        page_limit = max(0, int(limit))
+        page_offset = max(0, int(offset))
+        # 窗口函数在一次扫描里同时给出 total，省掉历史实现里额外的 COUNT(*) 全表扫
+        rows = conn.execute(
+            "SELECT addr, text, length, segment, COUNT(*) OVER () AS total "
+            f"FROM strings WHERE {clause} ORDER BY ea LIMIT ? OFFSET ?",
+            params + (page_limit, page_offset),
+        ).fetchall()
+        total = (
+            int(rows[0]["total"])
+            if rows
+            else _count(conn, f"SELECT COUNT(*) FROM strings WHERE {clause}", params)
         )
         items: list[StringItem] = []
-        for row in cur.fetchall():
+        for row in rows:
             item = _row_to_string_item(row)
             if include_xrefs:
                 item["xrefs"] = _xrefs_for_string(conn, item["addr"])
@@ -194,8 +249,8 @@ def find_regex(
         return {
             "items": items,
             "total": total,
-            "offset": int(offset),
-            "limit": int(limit),
+            "offset": page_offset,
+            "limit": page_limit,
             "source": "sqlite_cache",
         }
     finally:
@@ -215,17 +270,24 @@ def list_funcs(
         where = ""
         params: tuple = ()
         if name_pattern:
-            where = " WHERE name REGEXP ?"
-            params = (name_pattern,)
+            clause, clause_params = _text_clause("name", name_pattern)
+            where = f" WHERE {clause}"
+            params = clause_params
 
-        total = _count(conn, f"SELECT COUNT(*) FROM functions{where}", params)
-        cur = conn.execute(
-            f"SELECT addr, name, size, segment, has_type FROM functions{where} "
-            f"ORDER BY ea LIMIT ? OFFSET ?",
-            params + (int(limit), int(offset)),
+        page_limit = max(0, int(limit))
+        page_offset = max(0, int(offset))
+        rows = conn.execute(
+            f"SELECT addr, name, size, segment, has_type, COUNT(*) OVER () AS total "
+            f"FROM functions{where} ORDER BY ea LIMIT ? OFFSET ?",
+            params + (page_limit, page_offset),
+        ).fetchall()
+        total = (
+            int(rows[0]["total"])
+            if rows
+            else _count(conn, f"SELECT COUNT(*) FROM functions{where}", params)
         )
         items: list[FunctionItem] = []
-        for row in cur.fetchall():
+        for row in rows:
             item = _row_to_function_item(row)
             if include_xrefs:
                 item["xrefs_to"] = _xrefs_for_function_to(conn, item["addr"])
@@ -233,8 +295,8 @@ def list_funcs(
         return {
             "items": items,
             "total": total,
-            "offset": int(offset),
-            "limit": int(limit),
+            "offset": page_offset,
+            "limit": page_limit,
             "source": "sqlite_cache",
         }
     finally:
@@ -253,21 +315,28 @@ def list_globals(
         where = ""
         params: tuple = ()
         if name_pattern:
-            where = " WHERE name REGEXP ?"
-            params = (name_pattern,)
+            clause, clause_params = _text_clause("name", name_pattern)
+            where = f" WHERE {clause}"
+            params = clause_params
 
-        total = _count(conn, f"SELECT COUNT(*) FROM globals{where}", params)
-        cur = conn.execute(
-            f"SELECT addr, name, size, segment FROM globals{where} "
-            f"ORDER BY ea LIMIT ? OFFSET ?",
-            params + (int(limit), int(offset)),
+        page_limit = max(0, int(limit))
+        page_offset = max(0, int(offset))
+        rows = conn.execute(
+            f"SELECT addr, name, size, segment, COUNT(*) OVER () AS total "
+            f"FROM globals{where} ORDER BY ea LIMIT ? OFFSET ?",
+            params + (page_limit, page_offset),
+        ).fetchall()
+        total = (
+            int(rows[0]["total"])
+            if rows
+            else _count(conn, f"SELECT COUNT(*) FROM globals{where}", params)
         )
-        items = [_row_to_global_item(r) for r in cur.fetchall()]
+        items = [_row_to_global_item(r) for r in rows]
         return {
             "items": items,
             "total": total,
-            "offset": int(offset),
-            "limit": int(limit),
+            "offset": page_offset,
+            "limit": page_limit,
             "source": "sqlite_cache",
         }
     finally:
@@ -287,26 +356,34 @@ def list_imports(
         clauses: list[str] = []
         params_list: list[str] = []
         if name_pattern:
-            clauses.append("name REGEXP ?")
-            params_list.append(name_pattern)
+            clause, clause_params = _text_clause("name", name_pattern)
+            clauses.append(clause)
+            params_list.extend(clause_params)
         if module_pattern:
-            clauses.append("module REGEXP ?")
-            params_list.append(module_pattern)
+            clause, clause_params = _text_clause("module", module_pattern)
+            clauses.append(clause)
+            params_list.extend(clause_params)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params = tuple(params_list)
 
-        total = _count(conn, f"SELECT COUNT(*) FROM imports{where}", params)
-        cur = conn.execute(
-            f"SELECT addr, name, module FROM imports{where} "
-            f"ORDER BY ea LIMIT ? OFFSET ?",
-            params + (int(limit), int(offset)),
+        page_limit = max(0, int(limit))
+        page_offset = max(0, int(offset))
+        rows = conn.execute(
+            f"SELECT addr, name, module, COUNT(*) OVER () AS total "
+            f"FROM imports{where} ORDER BY ea LIMIT ? OFFSET ?",
+            params + (page_limit, page_offset),
+        ).fetchall()
+        total = (
+            int(rows[0]["total"])
+            if rows
+            else _count(conn, f"SELECT COUNT(*) FROM imports{where}", params)
         )
-        items = [_row_to_import_item(r) for r in cur.fetchall()]
+        items = [_row_to_import_item(r) for r in rows]
         return {
             "items": items,
             "total": total,
-            "offset": int(offset),
-            "limit": int(limit),
+            "offset": page_offset,
+            "limit": page_limit,
             "source": "sqlite_cache",
         }
     finally:
@@ -329,21 +406,28 @@ def entity_query(
             clauses: list[str] = []
             params_list: list[str] = []
             if name_pattern:
-                clauses.append("text REGEXP ?")
-                params_list.append(name_pattern)
+                clause, clause_params = _text_clause("text", name_pattern)
+                clauses.append(clause)
+                params_list.extend(clause_params)
             if segment:
                 clauses.append("segment = ?")
                 params_list.append(segment)
             where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
             params = tuple(params_list)
-            total = _count(conn, f"SELECT COUNT(*) FROM strings{where}", params)
-            cur = conn.execute(
-                f"SELECT addr, text, length, segment FROM strings{where} "
-                f"ORDER BY ea LIMIT ? OFFSET ?",
-                params + (int(limit), int(offset)),
+            page_limit = max(0, int(limit))
+            page_offset = max(0, int(offset))
+            rows = conn.execute(
+                f"SELECT addr, text, length, segment, COUNT(*) OVER () AS total "
+                f"FROM strings{where} ORDER BY ea LIMIT ? OFFSET ?",
+                params + (page_limit, page_offset),
+            ).fetchall()
+            total = (
+                int(rows[0]["total"])
+                if rows
+                else _count(conn, f"SELECT COUNT(*) FROM strings{where}", params)
             )
             str_items: list[EntityItem] = []
-            for row in cur.fetchall():
+            for row in rows:
                 item = _row_to_string_item(row)
                 if include_xrefs:
                     item["xrefs"] = _xrefs_for_string(conn, item["addr"])
@@ -352,8 +436,8 @@ def entity_query(
                 "kind": "strings",
                 "items": str_items,
                 "total": total,
-                "offset": int(offset),
-                "limit": int(limit),
+                "offset": page_offset,
+                "limit": page_limit,
                 "source": "sqlite_cache",
             }
         finally:
@@ -409,7 +493,11 @@ def entity_query(
 
 
 def cache_status(db_path: str) -> CacheStatusResult:
-    """查询缓存元信息；文件不存在时 status='missing'，不会抛错。"""
+    """查询缓存元信息；文件不存在时 status='missing'，不会抛错。
+
+    行数优先读 meta 里的 `count_<table>`（O(1)），只有老缓存缺少该键时才回退到
+    `COUNT(*)`（大库上 6 张表各一次全表扫代价很高，而本工具会被频繁调用）。
+    """
     if not os.path.exists(db_path):
         return {
             "exists": False,
@@ -422,18 +510,52 @@ def cache_status(db_path: str) -> CacheStatusResult:
             "function_xrefs": 0,
             "globals": 0,
             "imports": 0,
+            "partial": False,
+            "counts_source": "meta",
+            "progress": {},
         }
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
     try:
-        meta_rows = conn.execute("SELECT key, value FROM meta").fetchall()
+        try:
+            meta_rows = conn.execute("SELECT key, value FROM meta").fetchall()
+        except sqlite3.Error:
+            meta_rows = []
         meta = {str(r["key"]): str(r["value"]) for r in meta_rows}
 
+        counts_source = "meta"
+
         def _tbl_count(tbl: str) -> int:
+            nonlocal counts_source
+            raw = meta.get(f"count_{tbl}", "")
+            if raw:
+                try:
+                    return int(raw)
+                except ValueError:
+                    pass
+            counts_source = "count"
             row = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()
             return int(row[0]) if row else 0
 
-        return {
+        def _meta_int(key: str, default: int = 0) -> int:
+            try:
+                return int(float(meta.get(key, "") or default))
+            except ValueError:
+                return default
+
+        skipped_raw = meta.get("tables_skipped", "")
+        progress = {
+            "phase": meta.get("progress_phase", ""),
+            "table": meta.get("progress_table", ""),
+            "rows": _meta_int("progress_rows"),
+            "total": _meta_int("progress_total"),
+            "elapsed_ms": _meta_int("elapsed_ms"),
+            "peak_rss_mb": _meta_int("peak_rss_mb"),
+            "refreshing": meta.get("refreshing", "0") == "1",
+            "build_id": _meta_int("build_id"),
+        }
+
+        result: CacheStatusResult = {
             "exists": True,
             "db_path": db_path,
             "status": meta.get("status", ""),
@@ -444,6 +566,14 @@ def cache_status(db_path: str) -> CacheStatusResult:
             "function_xrefs": _tbl_count("function_xrefs"),
             "globals": _tbl_count("globals"),
             "imports": _tbl_count("imports"),
+            "schema_version": _meta_int("schema_version"),
+            "partial": meta.get("partial", "0") == "1",
+            "last_error": meta.get("last_error", ""),
+            "degraded_reason": meta.get("degraded_reason", ""),
+            "tables_skipped": [t for t in skipped_raw.split(",") if t],
+            "counts_source": counts_source,
+            "progress": progress,
         }
+        return result
     finally:
         conn.close()
