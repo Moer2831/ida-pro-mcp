@@ -813,19 +813,31 @@ class DispatchTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"ida_kernwin": fake}):
             self.assertIsNone(cache_backend.run_on_ida_main(lambda: 1))
 
-    def test_wait_for_idle_fails_open_after_repeated_dispatch_failure(self) -> None:
-        with mock.patch(
-            "ida_pro_mcp.broker.cache_backend.run_on_ida_main", lambda fn: None
-        ), mock.patch.object(sqlite_cache, "IDLE_POLL_SEC", 0.0):
-            handle = sqlite_cache._DaemonHandle(  # noqa: SLF001
-                idb_path="x.i64",
-                db_path="x.i64.mcp.sqlite",
-                thread=None,
-                stop_event=threading.Event(),
-                force_event=threading.Event(),
-            )
-            backend = make_backend()
-            self.assertTrue(sqlite_cache._wait_for_idle(handle, backend))  # noqa: SLF001
+    def test_wait_for_idle_is_pure_waiting(self) -> None:
+        """空闲等待不再 fail-open、也不再派发（保存期间卡死 IDA 的根因）。
+
+        新契约：只有"空闲 + 过了保存静默窗口"才返回 True；stop_event 置位返回 False。
+        完整的门控回归见 tests/test_cache_save_safety.py。
+        """
+        handle = sqlite_cache._DaemonHandle(  # noqa: SLF001
+            idb_path="x.i64",
+            db_path="x.i64.mcp.sqlite",
+            thread=None,
+            stop_event=threading.Event(),
+            force_event=threading.Event(),
+        )
+        handle.idle_backend = make_backend()
+        # 假装主线程定时器已安装：此时等待期间不应有任何兜底探测
+        handle.idle_timer_id = 42
+        with mock.patch.object(sqlite_cache, "IDLE_WATCH_POLL_SEC", 0.01):
+            timer = threading.Timer(0.1, handle.stop_event.set)
+            timer.start()
+            try:
+                started = time.time()
+                self.assertFalse(sqlite_cache._wait_for_idle(handle))  # noqa: SLF001
+                self.assertLess(time.time() - started, 5.0)
+            finally:
+                timer.cancel()
 
 
 class SnapshotTests(unittest.TestCase):

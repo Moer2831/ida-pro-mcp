@@ -1,8 +1,12 @@
 """Discovery API - list and switch between IDA instances.
 
 When running in streamable-http mode (client connects directly to IDA),
-select_instance makes this IDA instance proxy tool calls to the target.
+`redirect_to_instance` makes this IDA instance proxy tool calls to the target.
 This lets a single MCP endpoint reach any running IDA instance.
+
+命名注意：本模块的 `discover_local_instances` 是**本机扫描**视图（含尚未连到 Broker 的
+IDA 窗口），与 broker 侧**无需参数**的 `instance_list`（在册实例）是两件事，名字刻意区分开，
+避免模型把两者搞混。
 """
 
 import http.client
@@ -49,7 +53,7 @@ _redirect_targets: dict[str, tuple[str, int]] = {}
 _redirect_lock = threading.Lock()
 
 # Tools that are always handled locally, never proxied
-_LOCAL_TOOL_NAMES = {"list_instances", "select_instance"}
+_LOCAL_TOOL_NAMES = {"discover_local_instances", "redirect_to_instance"}
 
 
 def set_local_instance(host: str, port: int):
@@ -289,7 +293,7 @@ def _redirecting_dispatch(request):
             remote_result = proxy_to_instance(redirect[0], redirect[1], payload)
             if remote_result and "result" in remote_result:
                 remote_tools = remote_result["result"].get("tools", [])
-                # Filter out remote list_instances/select_instance to avoid duplicates
+                # Filter out remote discover_local_instances/redirect_to_instance to avoid duplicates
                 remote_tools = [
                     t for t in remote_tools if t.get("name") not in _LOCAL_TOOL_NAMES
                 ]
@@ -323,11 +327,13 @@ MCP_SERVER.registry.dispatch = _redirecting_dispatch
 
 
 @tool
-def list_instances() -> list[InstanceListItem]:
-    """List all discovered IDA Pro instances with their binary name, port, and reachability status.
+def discover_local_instances() -> list[InstanceListItem]:
+    """List IDA instances found by scanning this machine (host/port), with reachability and
+    which one currently handles your calls.
 
-    Use this to see which IDA databases are currently open and available for analysis.
-    The 'active' field indicates which instance is currently handling your tool calls.
+    Needs an `instance_id` argument to be routed (get one from the no-argument `instance_list`,
+    which lists the instances registered with the Broker). Use this tool only when you need the
+    local-scan view, e.g. an IDA window that is not connected to the Broker yet.
     """
     instances = discover_instances()
     result = []
@@ -347,15 +353,14 @@ def list_instances() -> list[InstanceListItem]:
 
 
 @tool
-def select_instance(
+def redirect_to_instance(
     port: Annotated[int, "Port number of the IDA instance to connect to"],
     host: Annotated[str, "Host address of the IDA instance"] = "127.0.0.1",
 ) -> InstanceSelectionResult:
-    """Switch to a different IDA Pro instance. All subsequent tool calls will be
-    routed to the selected instance. Use list_instances to see available instances.
+    """Redirect subsequent tool calls of this IDA instance to another IDA instance (proxy).
 
-    To switch back to this instance, call select_instance with this instance's port,
-    or call select_instance with port=0 to reset.
+    Use discover_local_instances to see candidates. To switch back to this instance, call
+    redirect_to_instance with this instance's port, or call it with port=0 to reset.
     """
     # Reset redirect
     if port == 0:

@@ -36,12 +36,19 @@ def dispatch_available() -> bool:
     return True
 
 
-def run_on_ida_main(fn: Callable[[], T]) -> Optional[T]:
+def run_on_ida_main(fn: Callable[[], T], *, db_read: bool = True) -> Optional[T]:
     """把 `fn` 派发到 IDA 主线程执行并同步取回结果。
 
-    有 IDA 内核时一律走 `execute_sync`：官方文档说明"当前线程不是主线程时排队执行，
-    是主线程时立即执行"，因此**两条路都安全**。只有完全没有 IDA 时才直接调用。
-    派发本身失败返回 None（调用方自行降级），但 `fn` 内部抛出的异常会原样上抛。
+    Args:
+        fn: 要执行的只读回调（IDAPython 只能在主线程调用）。
+        db_read: True（默认）用 `MFF_READ` —— 官方语义是"**只在 IDA 空闲且可安全查询
+            数据库时**才执行"；False 用 `MFF_FAST` —— "尽快执行，适用于**不查询数据库**的
+            调用"。**只探测状态（如"是否空闲"）时必须传 False**：用 MFF_READ 去询问
+            "IDA 空闲了吗"自相矛盾 —— 保存 IDB 期间 IDA 不是 idle，请求排队，而排队的
+            请求又让 IDA 一直不算 idle，循环等待会把 IDA 卡死（实测踩到）。
+
+    有 IDA 内核时一律走 `execute_sync`（主线程调用时会立即执行，两条路都安全）；
+    完全没有 IDA 的纯 Python 环境才直接调用。派发失败返回 None，`fn` 的异常原样上抛。
     """
     if not dispatch_available():
         return fn()
@@ -58,8 +65,9 @@ def run_on_ida_main(fn: Callable[[], T]) -> Optional[T]:
             exc_box.append(exc)
         return 1
 
+    flags = ida_kernwin.MFF_READ if db_read else ida_kernwin.MFF_FAST
     try:
-        ida_kernwin.execute_sync(runner, ida_kernwin.MFF_READ)
+        ida_kernwin.execute_sync(runner, flags)
     except Exception:  # noqa: BLE001 - 主线程不可达（例如内核未就绪）
         return None
     if exc_box:

@@ -76,6 +76,7 @@ class CacheStats:
     elapsed_ms: float = 0.0
     peak_rss_mb: float = 0.0
     chunks: int = 0
+    slow_dispatches: int = 0
     tables_skipped: tuple[str, ...] = ()
     tables_aborted: tuple[str, ...] = ()
     tables_cleared: tuple[str, ...] = ()
@@ -94,6 +95,7 @@ class CacheStats:
             "elapsed_ms": round(self.elapsed_ms, 1),
             "peak_rss_mb": round(self.peak_rss_mb, 1),
             "chunks": self.chunks,
+            "slow_dispatches": self.slow_dispatches,
             "tables_skipped": list(self.tables_skipped),
             "tables_aborted": list(self.tables_aborted),
             "tables_cleared": list(self.tables_cleared),
@@ -129,8 +131,13 @@ def _fingerprint_extractor(
     chunker: AdaptiveChunker,
     *,
     should_stop: Callable[[], bool],
+    wait_ready: Optional[Callable[[], bool]] = None,
 ) -> tuple[Optional[str], int]:
-    """只读 pass：分块哈希指定提取器覆盖的数据，返回 (digest, 块数)。"""
+    """只读 pass：分块哈希指定提取器覆盖的数据，返回 (digest, 块数)。
+
+    `wait_ready` 为派发前置条件（IDA 空闲且刚保存过则等静默窗口）；不满足时不派发，
+    直接返回 (None, chunks)，由调用方按 `NOT_READY_REASON` 中止本轮。
+    """
     from .cache_backend import run_on_ida_main
 
     fingerprint = Fingerprint()
@@ -139,6 +146,8 @@ def _fingerprint_extractor(
     while True:
         if should_stop():
             return (None, chunks)
+        if wait_ready is not None and not wait_ready():
+            return (None, chunks)
         started = time.perf_counter()
         result = run_on_ida_main(
             lambda: extractor.chunk(
@@ -146,6 +155,7 @@ def _fingerprint_extractor(
             )
         )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
+        _warn_if_slow_dispatch(extractor.name, elapsed_ms)
         if result is None:
             return (None, chunks)
         chunker.observe(max(1, result.items), elapsed_ms)
@@ -156,6 +166,18 @@ def _fingerprint_extractor(
     return (fingerprint.digest(), chunks)
 
 
+def _warn_if_slow_dispatch(label: str, elapsed_ms: float) -> bool:
+    """单次派发明显偏慢时打日志（下次卡顿时 Output 窗口能直接看出卡在哪一步）。"""
+    if elapsed_ms < DISPATCH_WARN_SEC * 1000.0:
+        return False
+    print(
+        f"[MCP][cache] 派发耗时 {elapsed_ms:.0f}ms（>{DISPATCH_WARN_SEC:.0f}s）: {label}"
+        " —— IDA 可能正忙（保存/分析/模态对话框），已按空闲门控等待",
+        file=sys.stderr,
+    )
+    return True
+
+
 def build_cache(
     db_path: str,
     backend: Any,
@@ -164,6 +186,7 @@ def build_cache(
     writer_factory: Callable[[str, CacheConfig], CacheWriter] = CacheWriter,
     chunker: Optional[AdaptiveChunker] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    wait_ready: Optional[Callable[[], bool]] = None,
     rss_limit_mb: Optional[int] = None,
     idb_mtime: float = 0.0,
 ) -> CacheStats:
@@ -176,10 +199,13 @@ def build_cache(
         writer_factory: 写入器工厂（单测可注入以观察调用序列）。
         chunker: 自适应分块器（缺省按 config 构造）。
         should_stop: 取消回调，返回 True 时优雅收尾（保留旧快照）。
+        wait_ready: 派发前置条件（IDA 空闲且不在保存后的静默窗口内）；返回 False 时
+            本轮以 `NOT_READY_REASON` 中止并保留旧快照，等下次触发重试。
         rss_limit_mb: 覆盖配置里的 RSS 上限（单测用）。
     """
     cfg = config or load_cache_config()
     stop = should_stop or (lambda: False)
+    ready = wait_ready or (lambda: True)
     chunker = chunker or AdaptiveChunker(
         chunk_rows=cfg.chunk_rows,
         target_ms=cfg.target_chunk_ms,
@@ -217,9 +243,14 @@ def build_cache(
             digest: Optional[str] = None
             if cfg.incremental:
                 digest, fp_chunks = _fingerprint_extractor(
-                    extractor, chunker, should_stop=stop
+                    extractor, chunker, should_stop=stop, wait_ready=ready
                 )
                 stats.chunks += fp_chunks
+                if not ready():
+                    # 指纹 pass 因"不可派发"中止：不要带着半截状态继续建表
+                    reasons.append(NOT_READY_REASON)
+                    stats.partial = True
+                    break
                 if digest and _tables_unchanged(writer, extractor.name, tables, digest):
                     for table in tables:
                         writer.skip_table(table, fingerprint=digest)
@@ -233,15 +264,22 @@ def build_cache(
             limit_hit = ""
             rss_hit = False
             dispatch_failed = False
+            not_ready = False
 
             while True:
                 if stop():
                     reasons.append("stopped")
                     stats.partial = True
                     break
+                if not ready():
+                    # IDA 正忙（保存/分析/模态框）：本轮中止、保留旧快照，等下次触发重试
+                    not_ready = True
+                    break
                 started = time.perf_counter()
                 result = _next_chunk(extractor, cursor, chunker)
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
+                if _warn_if_slow_dispatch(extractor.name, elapsed_ms):
+                    stats.slow_dispatches += 1
                 if result is None:
                     dispatch_failed = True
                     break
@@ -271,8 +309,10 @@ def build_cache(
                 if result.done:
                     break
 
-            if limit_hit or rss_hit or dispatch_failed:
-                if dispatch_failed:
+            if limit_hit or rss_hit or dispatch_failed or not_ready:
+                if not_ready:
+                    detail = "IDA 忙或刚保存过（空闲门控未放行），本轮放弃，稍后重试"
+                elif dispatch_failed:
                     detail = "提取派发失败（IDA 主线程不可达）"
                 elif limit_hit:
                     detail = f"超过 IDA_MCP_CACHE_MAX_ROWS={cfg.max_rows}（表 {limit_hit}）"
@@ -284,8 +324,8 @@ def build_cache(
                     writer.abort_table(table, error=detail)
                 aborted.extend(tables)
                 stats.partial = True
-                reasons.append(detail)
-                if rss_hit or dispatch_failed:
+                reasons.append(NOT_READY_REASON if not_ready else detail)
+                if rss_hit or dispatch_failed or not_ready:
                     break
                 continue
 
@@ -376,7 +416,58 @@ def _fill_counts(writer: CacheWriter, stats: CacheStats) -> None:
 # ============================================================================
 
 REFRESH_INTERVAL_SEC = 30 * 60  # 30 分钟兜底轮询
-IDLE_POLL_SEC = 2.0  # 未就绪时的快速探测节奏
+IDLE_POLL_SEC = 2.0  # 兜底探测（无主线程定时器时）的节奏
+IDLE_WATCH_INTERVAL_MS = 500  # 主线程空闲定时器的刷新间隔
+IDLE_WATCH_POLL_SEC = 0.25  # 守护线程检查空闲标志的节奏
+SAVE_QUIET_SEC = 5.0  # 收到 IDB 保存信号后再等多久才允许派发
+DISPATCH_WARN_SEC = 5.0  # 单次派发超过该时长就打日志（用于诊断卡顿）
+NOT_READY_REASON = "not-ready"
+
+
+@dataclass
+class IdaIdleState:
+    """IDA 主线程空闲状态：**由主线程定时器写、守护线程只读**。
+
+    为什么不直接派发询问：`MFF_READ` 的官方语义是"只在 IDA 空闲时才执行"，用它去问
+    "IDA 空闲了吗"会形成循环等待 —— 保存 IDB 期间 IDA 不是 idle，请求排队；而排队中的
+    请求又让 IDA 一直不算 idle，最终把 IDA 卡死（实测：保存完成后守护线程仍拿不到结果，
+    缓存库再无任何写入）。所以空闲判定必须由主线程自己维护，守护线程只读一个普通变量。
+    """
+
+    quiet_sec: float = SAVE_QUIET_SEC
+    idle: bool = False
+    last_save_ts: float = 0.0
+    last_tick_ts: float = 0.0
+    ticks: int = 0
+
+    def mark_save(self, now: Optional[float] = None) -> None:
+        """记录一次"IDB 正在保存"信号（由 IDB_Hooks.savebase 在主线程调用）。"""
+        self.last_save_ts = time.monotonic() if now is None else float(now)
+        self.idle = False
+
+    def set_idle(self, idle: bool, now: Optional[float] = None) -> None:
+        """主线程定时器写入最新空闲状态。"""
+        ts = time.monotonic() if now is None else float(now)
+        self.idle = bool(idle)
+        self.last_tick_ts = ts
+        self.ticks += 1
+
+    def is_ready(self, now: Optional[float] = None) -> bool:
+        """当前是否适合派发需要读库的提取请求。"""
+        if not self.idle:
+            return False
+        if self.last_save_ts <= 0:
+            return True
+        ts = time.monotonic() if now is None else float(now)
+        return (ts - self.last_save_ts) >= self.quiet_sec
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "idle": self.idle,
+            "ticks": self.ticks,
+            "last_save_ts": round(self.last_save_ts, 3),
+            "quiet_sec": self.quiet_sec,
+        }
 
 
 @dataclass
@@ -392,6 +483,11 @@ class _DaemonHandle:
     idb_hook: Optional[object] = None
     progress: TableProgress = field(default_factory=TableProgress)
     builds: int = 0
+    idle_state: IdaIdleState = field(default_factory=IdaIdleState)
+    idle_timer_id: int = -1
+    idle_backend: Any = None
+    slow_dispatches: int = 0
+    pauses: int = 0
 
 
 _daemons: dict[str, _DaemonHandle] = {}
@@ -416,10 +512,14 @@ def _run_build_once(
         backend,
         config,
         should_stop=handle.stop_event.is_set,
+        wait_ready=handle.idle_state.is_ready,
         idb_mtime=_ida_idb_mtime(handle.idb_path),
     )
     handle.last_stats = stats
     handle.builds += 1
+    if NOT_READY_REASON in stats.reason:
+        handle.pauses += 1
+    handle.slow_dispatches += stats.slow_dispatches
     handle.progress = TableProgress(
         table="",
         phase="idle",
@@ -454,37 +554,87 @@ def _default_backend_factory() -> Any:
 _backend_factory: Callable[[], Any] = _default_backend_factory
 
 
-def _wait_for_idle(handle: _DaemonHandle, backend: Any) -> bool:
-    """等待 IDA 空闲（经主线程派发询问）；stop_event 置位时返回 False。
+def _install_idle_watcher(handle: _DaemonHandle, backend: Any) -> bool:
+    """用 IDA **主线程定时器**维护空闲标志（必须在主线程调用本函数）。
 
-    派发连续失败（主线程不可达）时 fail-open 直接开建：宁可早点建缓存，
-    也不要让守护线程永远空等 —— 历史上就踩过"永远等不到空闲"的坑。
+    此后守护线程只读 `handle.idle_state`，不再派发任何"是否空闲"的请求 ——
+    那正是把 IDA 卡死的循环等待路径（MFF_READ 只在 idle 时执行，而排队的请求又让
+    IDA 一直不算 idle）。
     """
+    handle.idle_backend = backend
+
+    def _tick() -> int:
+        try:
+            handle.idle_state.set_idle(bool(backend.is_idle()))
+        except Exception:  # noqa: BLE001 - 定时器回调绝不能抛
+            pass
+        return IDLE_WATCH_INTERVAL_MS
+
+    try:
+        import ida_kernwin  # type: ignore
+
+        handle.idle_timer_id = int(
+            ida_kernwin.register_timer(IDLE_WATCH_INTERVAL_MS, _tick)
+        )
+        return True
+    except Exception:  # noqa: BLE001 - 无 IDA / 注册失败 → 退化为兜底探测
+        handle.idle_timer_id = -1
+        return False
+
+
+def _uninstall_idle_watcher(handle: _DaemonHandle) -> None:
+    if handle.idle_timer_id < 0:
+        return
+    try:
+        import ida_kernwin  # type: ignore
+
+        ida_kernwin.unregister_timer(handle.idle_timer_id)
+    except Exception:  # noqa: BLE001
+        pass
+    handle.idle_timer_id = -1
+
+
+def _probe_idle_once(handle: _DaemonHandle) -> None:
+    """兜底探测（仅在主线程定时器不可用时使用）。
+
+    必须 `db_read=False`（MFF_FAST）：只查状态、不查数据库；用 MFF_READ 会要求
+    IDA 先 idle，从而形成循环等待。
+    """
+    backend = handle.idle_backend
+    if backend is None:
+        handle.idle_state.set_idle(True)  # 无 IDA（单测）视为空闲
+        return
     from .cache_backend import run_on_ida_main
 
-    dispatch_failures = 0
+    probe = run_on_ida_main(backend.is_idle, db_read=False)
+    if probe is None:
+        return  # 派发不可达：保持上次状态，由调用方按停止事件退出
+    handle.idle_state.set_idle(bool(probe))
+
+
+def _wait_for_idle(handle: _DaemonHandle) -> bool:
+    """等待"可以安全构建"：IDA 空闲，且距上次 IDB 保存信号已过静默窗口。
+
+    本函数**只等待、不派发**（派发才是卡死根因）。stop_event 置位时返回 False。
+    """
+    has_timer = handle.idle_timer_id >= 0
     while not handle.stop_event.is_set():
-        idle = run_on_ida_main(backend.is_idle)
-        if idle:
+        if not has_timer:
+            _probe_idle_once(handle)
+        if handle.idle_state.is_ready():
             return True
-        if idle is None:
-            dispatch_failures += 1
-            if dispatch_failures >= 3:
-                print(
-                    "[MCP][cache] 无法派发到 IDA 主线程，跳过空闲等待直接构建。",
-                    file=sys.stderr,
-                )
-                return True
-        handle.stop_event.wait(IDLE_POLL_SEC)
+        handle.stop_event.wait(IDLE_WATCH_POLL_SEC)
     return False
 
 
 def _daemon_loop(handle: _DaemonHandle) -> None:
     """守护线程主循环。
 
-    1. 首次：等 IDA 空闲后做一轮构建。
+    1. 首次：等"空闲门控"放行后做一轮构建。
     2. 之后：等待 force_event（IDB 保存 / refresh_cache 工具）或 30 分钟兜底；
        IDB mtime 未变化时跳过重建（除非是被 force 唤醒）。
+    3. 若某轮因 IDA 正忙（保存/分析中）而门控未放行，立刻重新排队重试，
+       而不是干等 30 分钟。
     """
     config = load_cache_config()
     if config.disabled:
@@ -494,20 +644,30 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
         )
         return
 
-    backend = _backend_factory()
+    backend = handle.idle_backend or _backend_factory()
+    handle.idle_backend = backend
     print(
         f"[MCP][cache] 守护线程启动，目标数据库: {handle.db_path} "
         f"(scope={config.scope}, chunk={config.chunk_rows}, "
-        f"incremental={int(config.incremental)}, fp={config.fingerprint})",
+        f"incremental={int(config.incremental)}, fp={config.fingerprint}, "
+        f"idle_timer={'on' if handle.idle_timer_id >= 0 else 'fallback'})",
         file=sys.stderr,
     )
 
-    if _wait_for_idle(handle, backend):
+    def _build() -> bool:
+        """跑一轮构建；返回是否应立即重试（门控曾未放行）。"""
         try:
-            _run_build_once(handle, backend, config)
+            stats = _run_build_once(handle, backend, config)
         except Exception as exc:  # noqa: BLE001
             handle.last_error = str(exc)
             print(f"[MCP][cache] 构建失败: {exc}", file=sys.stderr)
+            return False
+        return NOT_READY_REASON in stats.reason
+
+    if _wait_for_idle(handle):
+        retry = _build()
+        if retry:
+            handle.force_event.set()
 
     while not handle.stop_event.is_set():
         triggered = handle.force_event.wait(REFRESH_INTERVAL_SEC)
@@ -522,13 +682,12 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
                     file=sys.stderr,
                 )
                 continue
-        if not _wait_for_idle(handle, backend):
+        if not _wait_for_idle(handle):
             break
-        try:
-            _run_build_once(handle, backend, config)
-        except Exception as exc:  # noqa: BLE001
-            handle.last_error = str(exc)
-            print(f"[MCP][cache] 构建失败: {exc}", file=sys.stderr)
+        if _build():
+            # 门控未放行（IDA 忙/刚保存）：短暂等待后重新排队，避免空转到 30 分钟兜底
+            handle.stop_event.wait(IDLE_POLL_SEC)
+            handle.force_event.set()
 
 
 def _make_idb_save_hook(handle: _DaemonHandle) -> Any:
@@ -537,6 +696,9 @@ def _make_idb_save_hook(handle: _DaemonHandle) -> Any:
 
     class _Hook(ida_idp.IDB_Hooks):
         def savebase(self) -> int:
+            # 保存期间 IDA 不是 idle：先标记"刚保存过"，让守护线程等一个静默窗口，
+            # 避免在写库过程中派发 MFF_READ 请求（那会循环等待并卡死 IDA）。
+            handle.idle_state.mark_save()
             handle.force_event.set()
             return 0
 
@@ -571,6 +733,13 @@ def start_cache_daemon(idb_path: str) -> Optional[str]:
             stop_event=threading.Event(),
             force_event=threading.Event(),
         )
+        # 空闲状态由主线程定时器维护（本函数在 IDA 主线程调用）：
+        # 守护线程只读标志，绝不派发"是否空闲"的请求 —— 那是卡死 IDA 的根因。
+        try:
+            handle.idle_backend = _backend_factory()
+            _install_idle_watcher(handle, handle.idle_backend)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[MCP][cache] 空闲监视器安装失败（改用兜底探测）: {exc}", file=sys.stderr)
         thread = threading.Thread(
             target=_daemon_loop,
             args=(handle,),
@@ -606,6 +775,7 @@ def stop_cache_daemon(idb_path: str, *, timeout: float = 5.0) -> None:
         return
     handle.stop_event.set()
     handle.force_event.set()  # 唤醒等待
+    _uninstall_idle_watcher(handle)
     thread = handle.thread
     if thread is not None and thread.is_alive():
         thread.join(timeout=timeout)
@@ -622,6 +792,10 @@ def daemon_snapshot(idb_path: str) -> dict[str, Any]:
         "idb_path": handle.idb_path,
         "db_path": handle.db_path,
         "builds": handle.builds,
+        "pauses": handle.pauses,
+        "slow_dispatches": handle.slow_dispatches,
+        "idle_state": handle.idle_state.snapshot(),
+        "idle_timer_id": handle.idle_timer_id,
         "last_error": handle.last_error,
         "last_stats": handle.last_stats.as_dict() if handle.last_stats else None,
         "progress": handle.progress.as_meta(),

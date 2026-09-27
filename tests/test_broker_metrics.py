@@ -198,7 +198,12 @@ class SendRequestMetricsTests(RegistryMetricsTestBase):
             _request_payload(2), instance_id="nope", timeout=0.05
         )
         self.assertEqual(missing["error"]["code"], -32000)
-        self.assertEqual(missing["error"]["message"], "找不到目标实例: nope")
+        # 文案在 2.1.0 起附带了"当前可用实例 + 先调 instance_list"的提示，
+        # 这里断言前缀与关键提示词，避免锁死整句。
+        message = missing["error"]["message"]
+        self.assertTrue(message.startswith("找不到目标实例: nope"), message)
+        self.assertIn("当前可用实例", message)
+        self.assertIn("instance_list", message)
 
         metrics = REGISTRY.metrics_snapshot()
         self.assertEqual(metrics["requests_routed"], 2)

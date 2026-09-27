@@ -308,7 +308,12 @@ def rename(
         "批量重命名: 函数、全局变量、局部变量、栈变量。batch 可为空{}。格式: {func:[{addr,name}], data:[{old,new}], ...}",
     ],
 ) -> RenameResult:
-    """批量重命名: 函数、全局变量、局部变量、栈变量。支持 dry_run 等选项。"""
+    """批量重命名: 函数、全局变量、局部变量、栈变量。
+
+    选项写在 `batch` **内部**（不是顶层参数）: `dry_run` / `stop_on_error` / `allow_overwrite`。
+    示例: {"func":[{"addr":"0x401000","name":"new_name"}],"dry_run":true}
+    分组: func=[{addr,name}] / data=[{old,new}] / local=[{func_addr,old,new}] / stack=[{func_addr,old,new}]。
+    """
 
     stop_on_error = bool(batch.get("stop_on_error", False))
     dry_run = bool(batch.get("dry_run", False))

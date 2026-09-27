@@ -422,7 +422,14 @@ class IDARegistry:
                         }
                 
                 if not inst:
-                    message = f"找不到目标实例: {instance_id}"
+                    available = ", ".join(
+                        f"{i.instance_id}({i.name or '未命名'})"
+                        for i in self._instances.values()
+                    ) or "无"
+                    message = (
+                        f"找不到目标实例: {instance_id}。当前可用实例: {available}。"
+                        "请先调用 instance_list（无需参数）获取 instance_id。"
+                    )
                     self._metrics_fail_locked(message)
                     return {
                         "jsonrpc": "2.0",

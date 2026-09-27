@@ -115,6 +115,20 @@ def register_broker_tools(mcp):
 # ---------------------------------------------------------------------------
 
 
+def _instance_hint() -> str:
+    """给路由失败的错误信息附上"当前可用实例"，让模型能自我纠正。"""
+    try:
+        instances = get_broker_client().list_instances()
+    except Exception:  # noqa: BLE001 - 提示信息失败不能影响正常报错
+        return ""
+    if not instances:
+        return " 当前没有已连接的 IDA 实例：请启动 IDA（插件会自动连接），或按 Ctrl+Alt+M 手动重连。"
+    pairs = ", ".join(
+        f"{inst.get('instance_id')}({inst.get('name') or '未命名'})" for inst in instances
+    )
+    return f" 当前可用实例: {pairs}。"
+
+
 def route_to_ida(request: dict) -> JsonRpcResponse | None:
     """将请求路由到指定的 IDA 实例 (通过 Broker)。"""
     broker = get_broker_client()
@@ -137,7 +151,10 @@ def route_to_ida(request: dict) -> JsonRpcResponse | None:
                 "jsonrpc": "2.0",
                 "error": {
                     "code": -32602,
-                    "message": "必须提供 instance_id 参数。请先调用 instance_list 查看并选择合适的客户端 ID。",
+                    "message": (
+                        "必须提供 instance_id 参数。请先调用 instance_list（无需参数）获取。"
+                        + _instance_hint()
+                    ),
                 },
                 "id": request.get("id"),
             }

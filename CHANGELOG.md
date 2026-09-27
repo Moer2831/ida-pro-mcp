@@ -4,6 +4,44 @@
 上游来源：[QiuChenly/ida-pro-mcp-enhancement](https://github.com/QiuChenly/ida-pro-mcp-enhancement)
 → [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)。
 
+## 2.1.1
+
+主题：**修复"保存 IDB 时 IDA 卡死"**（实测事故），并消除两个 API 易用性坑。
+
+### 卡死根因与修复
+
+- **根因**：`MFF_READ` 的官方语义是"**只在 IDA 空闲且可安全查询数据库时才执行**"。
+  旧实现却用 `execute_sync(..., MFF_READ)` 去询问"IDA 是否空闲"，形成循环等待：
+  保存 IDB 期间 IDA 不是 idle → 请求排队 → 排队的请求又让 IDA 一直不算 idle →
+  界面长时间无响应，且保存完成后守护线程仍拿不到结果（实测：`.i64` 已写盘，
+  缓存库再无任何写入，只能强杀 IDA）。
+- **修复**：空闲判定改由 **IDA 主线程定时器**维护（`ida_kernwin.register_timer`, 500ms），
+  守护线程只读一个普通变量，**等待期间零派发**；`savebase` 钩子额外标记"刚保存过"，
+  派发还需过 `SAVE_QUIET_SEC=5s` 静默窗口。
+- **逐块复查门控**：每个分块派发前复查门控；不放行则中止本轮（`NOT_READY_REASON`）、
+  **保留旧快照**，并在数秒后自动重新排队重试（不再干等 30 分钟兜底）。
+- **只探测状态时使用 `MFF_FAST`**：`run_on_ida_main(..., db_read=False)` 用于状态探测
+  （不查库、不要求 idle）；读库提取仍用 `MFF_READ`，但只在门控放行后发出。
+- **卡顿可诊断**：单次派发超过 `DISPATCH_WARN_SEC=5s` 会在 Output 窗口打印警告（含表名），
+  `daemon_snapshot` 也会给出 `pauses`、`slow_dispatches`、`idle_state`。
+- **版本可见**：插件启动首行打印 `[MCP] 插件代码: <路径> (v2.1.1, 缓存 schema v2)`。
+
+### API 易用性（消除命名陷阱与错误信息不足）
+
+- `list_instances` → **`discover_local_instances`**、`select_instance` → **`redirect_to_instance`**：
+  与 broker 侧**无需参数**的 `instance_list` 语义完全不同，旧名只差词序极易误用；
+  description 现在写明两者区别与"需先取 `instance_id`"。
+- `-32000 找不到目标实例: X` 附带"**当前可用实例: ida-27740(geek.exe)**"与
+  "请先调用 instance_list（无需参数）"；`-32602 必须提供 instance_id` 同样附带实例清单。
+- `rename` 的 tool description 补上参数示例：`dry_run` / `stop_on_error` / `allow_overwrite`
+  写在 **`batch` 内部**（不是顶层参数），并给出分组格式。
+
+### 测试
+
+- 新增 `tests/test_cache_save_safety.py`（15 项）：门控状态机、**等待期间零派发**、
+  兜底探测只允许 `MFF_FAST`、门控中途关闭保留旧快照、守护线程门控放行后重试成功、慢派发告警。
+- 全量 320 项通过（原 305 + 15）。
+
 ## 2.1.0
 
 主题：**大 IDB 的内存与性能**。历史实现把整库静态信息一次性物化成 Python 对象

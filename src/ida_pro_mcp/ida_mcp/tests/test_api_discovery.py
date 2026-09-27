@@ -1,6 +1,6 @@
 """Tests for the discovery API module (api_discovery.py).
 
-Tests dispatch routing decisions, loop prevention, select_instance state
+Tests dispatch routing decisions, loop prevention, redirect_to_instance state
 machine and tools/list merge logic.
 """
 
@@ -107,59 +107,59 @@ class _RecordingConnection:
 
 
 # ---------------------------------------------------------------------------
-# select_instance state machine
+# redirect_to_instance state machine
 # ---------------------------------------------------------------------------
 
 
 @test()
-def test_select_instance_port_zero_resets_redirect():
-    """select_instance(port=0) clears redirect and returns success."""
+def test_redirect_to_instance_port_zero_resets_redirect():
+    """redirect_to_instance(port=0) clears redirect and returns success."""
     with _SavedState():
         api_discovery._redirect_host = "10.0.0.1"
         api_discovery._redirect_port = 9999
-        result = api_discovery.select_instance(port=0)
+        result = api_discovery.redirect_to_instance(port=0)
         assert result["success"] is True
         assert api_discovery.get_redirect_target() is None
 
 
 @test()
-def test_select_instance_local_port_clears_redirect():
+def test_redirect_to_instance_local_port_clears_redirect():
     """Selecting the local instance's own port clears redirect."""
     with _SavedState():
         api_discovery.set_local_instance("127.0.0.1", 13337)
         api_discovery._redirect_host = "10.0.0.1"
         api_discovery._redirect_port = 9999
-        result = api_discovery.select_instance(port=13337, host="127.0.0.1")
+        result = api_discovery.redirect_to_instance(port=13337, host="127.0.0.1")
         assert result["success"] is True
         assert "local" in result.get("message", "").lower()
         assert api_discovery.get_redirect_target() is None
 
 
 @test()
-def test_select_instance_unreachable_returns_error():
+def test_redirect_to_instance_unreachable_returns_error():
     """Selecting an unreachable port returns success=False without changing state."""
     with _SavedState():
         api_discovery._redirect_host = None
         api_discovery._redirect_port = None
-        result = api_discovery.select_instance(port=1, host="127.0.0.1")
+        result = api_discovery.redirect_to_instance(port=1, host="127.0.0.1")
         assert result["success"] is False
         assert "not reachable" in result.get("error", "")
         assert api_discovery.get_redirect_target() is None
 
 
 @test()
-def test_select_instance_redirect_is_scoped_to_transport_session():
+def test_redirect_to_instance_redirect_is_scoped_to_transport_session():
     """Each MCP transport session should keep its own selected redirect target."""
     with _SavedState():
         original_probe = api_discovery.probe_instance
         api_discovery.probe_instance = lambda host, port: True
         try:
             api_discovery.MCP_SERVER._transport_session_id.data = "http:session-a"
-            result_a = api_discovery.select_instance(port=11111, host="127.0.0.1")
+            result_a = api_discovery.redirect_to_instance(port=11111, host="127.0.0.1")
             assert result_a["success"] is True
 
             api_discovery.MCP_SERVER._transport_session_id.data = "http:session-b"
-            result_b = api_discovery.select_instance(port=22222, host="127.0.0.1")
+            result_b = api_discovery.redirect_to_instance(port=22222, host="127.0.0.1")
             assert result_b["success"] is True
 
             api_discovery.MCP_SERVER._transport_session_id.data = "http:session-a"
@@ -229,13 +229,13 @@ def test_dispatch_notification_always_local():
 
 @test()
 def test_dispatch_local_tool_stays_local_when_redirecting():
-    """tools/call for list_instances dispatches locally even when redirect is active."""
+    """tools/call for discover_local_instances dispatches locally even when redirect is active."""
     with _SavedState():
         api_discovery._redirect_host = "10.0.0.99"
         api_discovery._redirect_port = 1
-        req = _make_jsonrpc("tools/call", {"name": "list_instances", "arguments": {}})
+        req = _make_jsonrpc("tools/call", {"name": "discover_local_instances", "arguments": {}})
         result = api_discovery._redirecting_dispatch(req)
-        # list_instances is a registered tool, so local dispatch succeeds.
+        # discover_local_instances is a registered tool, so local dispatch succeeds.
         assert "result" in result, f"Expected success result, got: {result}"
         assert not _is_proxy_error(result)
 
@@ -346,8 +346,8 @@ def test_dispatch_tools_list_returns_local_tools_when_redirect_unreachable():
         tools = result["result"].get("tools", [])
         tool_names = {t["name"] for t in tools}
         # The local discovery tools should always be present
-        assert "list_instances" in tool_names
-        assert "select_instance" in tool_names
+        assert "discover_local_instances" in tool_names
+        assert "redirect_to_instance" in tool_names
         assert "open_file" not in tool_names
 
 
@@ -363,5 +363,5 @@ def test_dispatch_tools_list_without_redirect_returns_all_tools():
         tools = result["result"].get("tools", [])
         tool_names = {t["name"] for t in tools}
         # Should have all registered IDA tools + discovery tools
-        assert "list_instances" in tool_names
+        assert "discover_local_instances" in tool_names
         assert "decompile" in tool_names
