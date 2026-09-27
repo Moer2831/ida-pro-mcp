@@ -420,9 +420,16 @@ def redirect_to_instance(
     # Reset redirect
     if port == 0:
         _clear_redirect_target()
+        # 注意：Broker 架构下插件从不调用 `set_local_instance()`，`_LOCAL_PORT` 恒为 None。
+        # 直接拼 `{host}:{port}` 会输出 "127.0.0.1:None" —— 功能没错但像个 bug，
+        # 实测在真机日志里就会被当成故障线索。这里改成按实际情况措辞。
         return {
             "success": True,
-            "message": f"Reset to local instance at {_LOCAL_HOST}:{_LOCAL_PORT}",
+            "message": (
+                f"Reset to local instance ({_LOCAL_HOST})"
+                if _LOCAL_PORT is None
+                else f"Reset to local instance at {_LOCAL_HOST}:{_LOCAL_PORT}"
+            ),
         }
 
     # Selecting the local instance clears redirect

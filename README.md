@@ -651,6 +651,11 @@ UI 定时器都会锁死主线程 —— 特征是"CPU 零增长、`.i64` 已解
 2.1.6 起该错误消息会附带"刷新 tools/list 或改用当前名字"的提示与可用方法示例，
 不再是一句干巴巴的 `Method not found`。
 
+> 小提示：`redirect_to_instance(port=0)`（旧名 `select_instance`）复位成功返回
+> `Reset to local instance (127.0.0.1)`。以前这里显示 `127.0.0.1:None`：Broker 架构下
+> 插件不上报本地监听端口，`_LOCAL_PORT` 恒为 `None`。功能一直正常，只是输出看着像故障，
+> 2.1.6 已改为按实际情况措辞。
+
 **Q：`discover_local_instances` 返回空列表（明明有 IDA 在跑）？**
 
 这是正常的：该工具扫描的是**旧的文件注册表** `~/.ida-pro-mcp/instances/instance_*.json`，
