@@ -455,21 +455,26 @@ _backend_factory: Callable[[], Any] = _default_backend_factory
 
 
 def _wait_for_idle(handle: _DaemonHandle, backend: Any) -> bool:
-    """等待 IDA 空闲；stop_event 置位时返回 False。
+    """等待 IDA 空闲（经主线程派发询问）；stop_event 置位时返回 False。
 
-    无头（idalib）环境直接放行：那里没有交互式分析要避让，而且**从后台线程调用
-    IDAPython 未必可用**（实测 idalib 下守护线程拿不到空闲判定），继续等只会永远
-    建不出缓存。GUI 下仍然按 IDLE_POLL_SEC 轮询等待。
+    派发连续失败（主线程不可达）时 fail-open 直接开建：宁可早点建缓存，
+    也不要让守护线程永远空等 —— 历史上就踩过"永远等不到空闲"的坑。
     """
-    from .cache_backend import is_headless, run_on_ida_main
+    from .cache_backend import run_on_ida_main
 
-    if is_headless():
-        return True
-
+    dispatch_failures = 0
     while not handle.stop_event.is_set():
         idle = run_on_ida_main(backend.is_idle)
         if idle:
             return True
+        if idle is None:
+            dispatch_failures += 1
+            if dispatch_failures >= 3:
+                print(
+                    "[MCP][cache] 无法派发到 IDA 主线程，跳过空闲等待直接构建。",
+                    file=sys.stderr,
+                )
+                return True
         handle.stop_event.wait(IDLE_POLL_SEC)
     return False
 

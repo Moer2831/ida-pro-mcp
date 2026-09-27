@@ -16,38 +16,34 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional, Sequence, TypeVar
 
-__all__ = ["run_on_ida_main", "is_headless", "IdaCacheBackend"]
+__all__ = ["dispatch_available", "run_on_ida_main", "IdaCacheBackend"]
 
 T = TypeVar("T")
 
 
-def is_headless() -> bool:
-    """是否存在"需要派发"的 GUI 主线程。
+def dispatch_available() -> bool:
+    """是否存在可派发的 IDA 内核（能 `import ida_kernwin` 即认为有）。
 
-    - 无 IDA 环境（单测）→ True（直接调用即可）
-    - idalib 无头 → True（`is_idaq()` 为 False）
-    - IDA GUI → False（必须走 `execute_sync`）
+    **不要**用 `ida_kernwin.is_idaq()` 做这个判断：它的语义是"IDAPython 是否由
+    IDAQ 承载"，在 IDB 装载早期、无头内核等情况下都可能返回 False，从而被误判成
+    "无需派发"，结果是缓存守护线程直接在自己的后台线程里碰 IDAPython，抛出
+    `Function can be called from the main thread only`（实测踩到）。
     """
     try:
-        import ida_kernwin  # type: ignore
-    except Exception:  # noqa: BLE001 - 没有 IDA 就是无头场景
-        return True
-    try:
-        return not bool(ida_kernwin.is_idaq())
-    except Exception:  # noqa: BLE001
-        # 判定失败时按"无 GUI 可派发"处理：直接调用至少能让缓存建出来，
-        # 而误判成 GUI 会让 execute_sync 拿不到主线程、守护线程永远空等。
-        return True
+        import ida_kernwin  # type: ignore  # noqa: F401
+    except Exception:  # noqa: BLE001 - 没有 IDA（单测/纯 Python）就是直调场景
+        return False
+    return True
 
 
 def run_on_ida_main(fn: Callable[[], T]) -> Optional[T]:
     """把 `fn` 派发到 IDA 主线程执行并同步取回结果。
 
-    GUI 下必须走 `execute_sync`（IDAPython 不是线程安全的）；无头/无 IDA 下
-    直接调用。派发本身失败时返回 None（调用方按"本轮放弃"处理），但 `fn`
-    内部抛出的异常会原样向上抛，方便定位真正的问题。
+    有 IDA 内核时一律走 `execute_sync`：官方文档说明"当前线程不是主线程时排队执行，
+    是主线程时立即执行"，因此**两条路都安全**。只有完全没有 IDA 时才直接调用。
+    派发本身失败返回 None（调用方自行降级），但 `fn` 内部抛出的异常会原样上抛。
     """
-    if is_headless():
+    if not dispatch_available():
         return fn()
 
     import ida_kernwin  # type: ignore
@@ -64,7 +60,7 @@ def run_on_ida_main(fn: Callable[[], T]) -> Optional[T]:
 
     try:
         ida_kernwin.execute_sync(runner, ida_kernwin.MFF_READ)
-    except Exception:  # noqa: BLE001 - 派发失败（主线程不可达）
+    except Exception:  # noqa: BLE001 - 主线程不可达（例如内核未就绪）
         return None
     if exc_box:
         raise exc_box[0]

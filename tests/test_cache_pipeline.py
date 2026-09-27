@@ -708,7 +708,7 @@ class DaemonLoopTests(unittest.TestCase):
         # 本用例模拟"无 IDA / 无头"进程；其它测试模块可能已 import 过 idapro，
         # 于是这里显式钉住 headless 判定，保证测试与环境无关。
         patcher = mock.patch(
-            "ida_pro_mcp.broker.cache_backend.is_headless", lambda: True
+            "ida_pro_mcp.broker.cache_backend.dispatch_available", lambda: False
         )
         patcher.start()
         try:
@@ -746,6 +746,86 @@ class DaemonLoopTests(unittest.TestCase):
         finally:
             sqlite_cache._backend_factory = original_factory  # noqa: SLF001
             patcher.stop()
+
+
+class DispatchTests(unittest.TestCase):
+    """主线程派发判定（历史上用 is_idaq() 误判过，导致后台线程直接碰 IDAPython）。"""
+
+    def _fake_kernwin(self, calls: list) -> object:
+        import types
+
+        fake = types.ModuleType("ida_kernwin")
+        fake.MFF_READ = 1  # type: ignore[attr-defined]
+
+        def execute_sync(fn, flags):  # noqa: ANN001
+            calls.append(("execute_sync", flags))
+            return fn()
+
+        fake.execute_sync = execute_sync  # type: ignore[attr-defined]
+        # 故意让 is_idaq() 返回 False：它表示"是否由 IDAQ 承载"，在装载早期不可靠，
+        # 代码不能依赖它来决定是否派发。
+        fake.is_idaq = lambda: False  # type: ignore[attr-defined]
+        return fake
+
+    def test_execute_sync_is_used_whenever_ida_is_present(self) -> None:
+        import sys
+
+        from ida_pro_mcp.broker import cache_backend
+
+        calls: list = []
+        with mock.patch.dict(sys.modules, {"ida_kernwin": self._fake_kernwin(calls)}):
+            self.assertTrue(cache_backend.dispatch_available())
+            self.assertEqual(cache_backend.run_on_ida_main(lambda: 42), 42)
+        self.assertEqual(calls, [("execute_sync", 1)])
+
+    def test_direct_call_without_ida(self) -> None:
+        import sys
+
+        from ida_pro_mcp.broker import cache_backend
+
+        with mock.patch.dict(sys.modules, {"ida_kernwin": None}):
+            self.assertFalse(cache_backend.dispatch_available())
+            self.assertEqual(cache_backend.run_on_ida_main(lambda: "direct"), "direct")
+
+    def test_callback_exception_propagates(self) -> None:
+        import sys
+
+        from ida_pro_mcp.broker import cache_backend
+
+        calls: list = []
+        with mock.patch.dict(sys.modules, {"ida_kernwin": self._fake_kernwin(calls)}):
+            with self.assertRaises(RuntimeError):
+                cache_backend.run_on_ida_main(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    def test_dispatch_failure_returns_none(self) -> None:
+        import sys
+        import types
+
+        from ida_pro_mcp.broker import cache_backend
+
+        fake = types.ModuleType("ida_kernwin")
+        fake.MFF_READ = 1  # type: ignore[attr-defined]
+
+        def boom(fn, flags):  # noqa: ANN001
+            raise RuntimeError("main thread unreachable")
+
+        fake.execute_sync = boom  # type: ignore[attr-defined]
+        with mock.patch.dict(sys.modules, {"ida_kernwin": fake}):
+            self.assertIsNone(cache_backend.run_on_ida_main(lambda: 1))
+
+    def test_wait_for_idle_fails_open_after_repeated_dispatch_failure(self) -> None:
+        with mock.patch(
+            "ida_pro_mcp.broker.cache_backend.run_on_ida_main", lambda fn: None
+        ), mock.patch.object(sqlite_cache, "IDLE_POLL_SEC", 0.0):
+            handle = sqlite_cache._DaemonHandle(  # noqa: SLF001
+                idb_path="x.i64",
+                db_path="x.i64.mcp.sqlite",
+                thread=None,
+                stop_event=threading.Event(),
+                force_event=threading.Event(),
+            )
+            backend = make_backend()
+            self.assertTrue(sqlite_cache._wait_for_idle(handle, backend))  # noqa: SLF001
 
 
 class SnapshotTests(unittest.TestCase):
