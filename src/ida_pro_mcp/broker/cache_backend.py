@@ -4,10 +4,10 @@
 ----
 - 本模块顶层**不 import 任何 IDA 模块**，所有 IDA 调用都延迟到方法内部，
   这样无 IDA 环境也能 import（单测会用假后端替换）。
-- 只读提取一律通过 `run_on_ida_main()` 派发：
-    * GUI（`ida_kernwin.is_idaq()` 为真）→ `execute_sync(..., MFF_READ)`；
-    * 无头 idalib → 直接调用（实测 `execute_sync` 在 idalib 下也可用，
-      但直调少一层派发，语义更直白）。
+- 只读提取一律通过 `run_on_ida_main()` 派发：只要存在 IDA 内核
+  （能 `import ida_kernwin`）就走 `execute_sync(..., MFF_READ)`；完全没有 IDA
+  的纯 Python 环境（单测）才直接调用。**不要**用 `is_idaq()` 判断，
+  它的语义是"IDAPython 是否由 IDAQ 承载"，在 IDB 装载早期会误报（见下）。
 - 每个方法都做了防御：IDA API 返回 None / 抛异常时返回空值，绝不让
   单条坏数据中断整轮缓存构建。
 """
