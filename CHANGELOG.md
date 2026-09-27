@@ -4,6 +4,60 @@
 上游来源：[QiuChenly/ida-pro-mcp-enhancement](https://github.com/QiuChenly/ida-pro-mcp-enhancement)
 → [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)。
 
+## 2.1.3
+
+主题：**按"事故类别"补齐边界防护** —— 前三次卡死（保存卡死、启动卡死 ×2）都是生产事故，
+这里不只修那一处，而是把同类形状全部找出来、修掉、并用可执行断言看住。
+
+### 一并纳入上一轮未提交的卡死修复
+
+- **第三次启动卡死的根因**：`start_cache_daemon()` 里调用 `register_timer()`，而它是在
+  **定时器回调内部**被调用的（`auto_connect_timer` → `_try_connect` → 启动守护线程），
+  在主循环回调里注册 UI 定时器同样锁死主线程。现在启动路径**零定时器注册**，
+  空闲状态由 `init()` 注册的那一个定时器统一调 `refresh_idle_states()` 刷新。
+- **新增 `IDA_MCP_DEBUG=1` 启动追踪**：`[MCP] trace: ...` 逐句打印启动路径
+  （走 stdout，IDA Output 窗口与 `ida.exe -L<log>` 都能看到），定位"卡在哪一句之后"
+  这类问题不再靠猜。默认关闭，零开销。
+
+### 修掉的三类真实缺陷
+
+- **IDB 钩子泄漏**（每次切换/重载累积一个）：`stop_cache_daemon()` 只停线程、**不注销**
+  `savebase` 钩子。切库 A→B 后两个钩子同时存活，旧钩子持续对已停止的句柄
+  `mark_save()`，钩子对象（连同句柄、线程引用）永不释放。现在统一走
+  `_drop_idb_hook()`：先清引用再 `unhook()`，失败只告警不影响停止流程。
+- **缓存库损坏 = 永久砖掉**：文件被写成垃圾或被截断后，`build_cache()` 每次重试都抛
+  `file is not a database` / `database disk image is malformed`，守护线程每 30 分钟
+  失败一次、永不恢复，必须手工删文件。现在 `CacheWriter.open()` 先用
+  `PRAGMA schema_version` 探活，不可用则**改名隔离**（`<库名>.corrupt-<时间戳>`）后重建；
+  连改名都失败（被占用）时退化为删除重建。
+- **诊断工具会把异常抛给 AI**：`cache_status()` 在文件不可读时抛 SQLite 异常。
+  现在它永不抛错：不可读 → `status=error` + `degraded_reason=cache-unreadable` +
+  `last_error` 原因；文件在但没建过 → `status=empty`（`degraded_reason=not-built`）。
+  （`_tbl_count` 仍只吞"no such table"，锁/IO 类错误照旧上抛，不掩盖真问题。）
+
+### 顺带修正
+
+- `refresh_idle_states()` 的返回值改为**成功刷新数**（探测抛异常的实例不再被计入），
+  与文档一致。
+- `cache_autostart` 模块文档更新为"定时器驱动"的现状（原文还写着 2.1.1 的 IDB 钩子方案）。
+- README 更正："插件不再注册任何 IDB 钩子"是不准确的 —— 缓存与调用记录各有一个
+  save/close 钩子，关键在于**注册动作只允许发生在 `init()` 路径**，且停止/关闭时必须注销。
+
+### 新增 42 项测试（总数 331 → 373）
+
+- `tests/test_incident_regressions.py`（15 项）：假 IDA 内核记录
+  `register_timer` / `IDB_Hooks.hook/unhook` / `execute_sync(flags)`，
+  于是三次事故的形状在没有 IDA 的 CI 里可复现 —— 启动路径零定时器、只注册一个钩子、
+  停止必注销、切换 IDB 不残留、**IDA 忙时绝不发 `MFF_READ`**、等待路径是慢轮询而非忙等、
+  IDA API 全炸时线程不崩且仍可停、5 次重启无线程/钩子泄漏。
+- `tests/test_hostile_environment.py`（22 项）：垃圾/截断/零字节/未来 schema 版本的缓存库
+  自愈与隔离、诊断工具永不抛错、3 读者 × 6 轮重建的并发换表不出现空表窗口、
+  环境变量垃圾值（0/负数/天文数字/全角/空格/`1e9`）全部被钳制、
+  RSS 护栏边界（恰好等于上限、0、未知读数不得误判超限）、切库不跨库串写。
+- `tests/test_static_sanity.py`（+4 项，改为全树 `ast` 守卫）：`broker/` 不得模块级导入 IDA；
+  `register_timer` 注册点白名单；`IDB_Hooks` 子类定义文件白名单（精确匹配）；
+  **IDB 回调内禁止注册定时器/钩子**（事故 2/3 的精确形状）。
+
 ## 2.1.2
 
 主题：**修复"IDA 一启动就卡死"**（2.1.1 引入的回归）。

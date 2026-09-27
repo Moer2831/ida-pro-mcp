@@ -35,7 +35,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _cache_fakes import build_test_db, make_backend  # noqa: E402
+from _cache_fakes import FakeBackend, build_test_db, make_backend  # noqa: E402
 
 from ida_pro_mcp.broker import cache_config, sqlite_cache  # noqa: E402
 from ida_pro_mcp.broker.cache_writer import STATUS_READY  # noqa: E402
@@ -132,6 +132,28 @@ class WaitForIdleTests(unittest.TestCase):
             self.assertLess(time.time() - started, 5.0)
         finally:
             timer.cancel()
+
+    def test_no_fallback_probe_when_plugin_timer_refreshes(self) -> None:
+        """一旦有外部刷新（插件定时器写入 ticks），等待期间就不该再兜底探测。"""
+        handle = self._handle()
+        handle.idle_backend = make_backend()
+        handle.idle_state.set_idle(False)  # ticks = 1：模拟插件定时器已在刷新
+        dispatched: list = []
+
+        def _spy(fn, **kwargs):  # noqa: ANN001
+            dispatched.append(kwargs)
+            return True
+
+        with mock.patch(
+            "ida_pro_mcp.broker.cache_backend.run_on_ida_main", _spy
+        ), mock.patch.object(sqlite_cache, "IDLE_WATCH_POLL_SEC", 0.01):
+            timer = threading.Timer(0.1, handle.stop_event.set)
+            timer.start()
+            try:
+                self.assertFalse(sqlite_cache._wait_for_idle(handle))  # noqa: SLF001
+            finally:
+                timer.cancel()
+        self.assertEqual(dispatched, [], "有插件定时器刷新时不得再兜底探测")
 
     def test_fallback_probe_uses_fast_flag_only(self) -> None:
         """无定时器时的兜底探测必须 db_read=False（MFF_FAST），永远不能是 MFF_READ。"""
@@ -266,6 +288,52 @@ class DaemonRetryTests(unittest.TestCase):
                 sqlite_cache._backend_factory = original_factory  # noqa: SLF001
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class IdleRefreshTests(unittest.TestCase):
+    """空闲状态由"启动时注册的那一个定时器"统一刷新。
+
+    关键约束：**守护线程启动路径绝不注册定时器** —— 在定时器回调/IDB 钩子里调用
+    `ida_kernwin.register_timer()` 会锁死 IDA 主线程（实测两次启动即卡死）。
+    """
+
+    def _handle(self, backend) -> sqlite_cache._DaemonHandle:  # noqa: SLF001
+        handle = sqlite_cache._DaemonHandle(  # noqa: SLF001
+            idb_path="x.i64",
+            db_path="x.i64.mcp.sqlite",
+            thread=None,
+            stop_event=threading.Event(),
+            force_event=threading.Event(),
+        )
+        handle.idle_backend = backend
+        return handle
+
+    def test_refresh_updates_handle_flags(self) -> None:
+        backend = FakeBackend(idle=True)
+        handle = self._handle(backend)
+        with mock.patch.dict(sqlite_cache._daemons, {"x.i64": handle}, clear=True):  # noqa: SLF001
+            self.assertEqual(sqlite_cache.refresh_idle_states(), 1)
+            self.assertTrue(handle.idle_state.idle)
+            backend._idle = False  # noqa: SLF001 - 假后端内部状态
+            sqlite_cache.refresh_idle_states()
+            self.assertFalse(handle.idle_state.idle)
+
+    def test_refresh_skips_handles_without_backend(self) -> None:
+        handle = self._handle(None)
+        with mock.patch.dict(sqlite_cache._daemons, {"x.i64": handle}, clear=True):  # noqa: SLF001
+            self.assertEqual(sqlite_cache.refresh_idle_states(), 0)
+
+    def test_refresh_tolerates_backend_exception(self) -> None:
+        class Boom:
+            def is_idle(self) -> bool:
+                raise RuntimeError("boom")
+
+        handle = self._handle(Boom())
+        handle.idle_state.set_idle(True)  # 先置为 True，异常时不应被改写
+        with mock.patch.dict(sqlite_cache._daemons, {"x.i64": handle}, clear=True):  # noqa: SLF001
+            # 返回值是"成功刷新数"：探测炸掉的实例不计入，但也不影响其它实例
+            self.assertEqual(sqlite_cache.refresh_idle_states(), 0)
+        self.assertTrue(handle.idle_state.idle)
 
 
 class DispatchFlagTests(unittest.TestCase):

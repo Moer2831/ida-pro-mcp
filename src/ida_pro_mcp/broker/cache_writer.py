@@ -23,7 +23,9 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -241,11 +243,15 @@ class CacheWriter:
     # -- 生命周期 ---------------------------------------------------------
 
     def open(self) -> None:
-        """连接数据库、应用 PRAGMA、按需迁移 schema、清理残留影子表。"""
+        """连接数据库、应用 PRAGMA、按需迁移 schema、清理残留影子表。
+
+        文件损坏（被写成垃圾 / 截断 / 半个磁盘镜像）时**隔离重建**而不是抛错：
+        缓存是可随时重建的派生物，若在这里抛错，守护线程会永久失败（每 30 分钟
+        重试一次、每次都失败），必须手工删文件才能恢复 —— 实测就是这种表现。
+        """
         if self._conn is not None:
             return
-        conn = sqlite3.connect(self.db_path, timeout=15.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
+        conn = self._open_usable()
         self._conn = conn
         self._started_at = self._clock()
         self._apply_pragmas()
@@ -253,6 +259,52 @@ class CacheWriter:
         self._migrate_if_needed()
         self._drop_stale_shadows()
         self._ensure_snapshot_status()
+
+    def _open_usable(self) -> sqlite3.Connection:
+        """返回一个**可用的**连接：文件损坏时先隔离（改名）再新建。"""
+        conn = sqlite3.connect(self.db_path, timeout=15.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA schema_version").fetchone()
+            return conn
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            quarantined = self._quarantine(exc)
+            print(
+                f"[MCP][cache] 缓存文件不可用（{exc}），已隔离为 {quarantined}，将重建。",
+                file=sys.stderr,
+            )
+        conn = sqlite3.connect(self.db_path, timeout=15.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _quarantine(self, exc: sqlite3.Error) -> str:
+        """把损坏的缓存文件改名保留（便于事后取证），返回新路径。"""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = f"{self.db_path}.corrupt-{stamp}"
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            src = f"{self.db_path}{suffix}"
+            if not os.path.exists(src):
+                continue
+            dst = f"{target}{suffix}"
+            try:
+                if suffix == "":
+                    os.replace(src, dst)
+                else:
+                    os.remove(src)  # WAL/SHM 属于坏库，直接丢
+            except OSError as rename_exc:
+                print(
+                    f"[MCP][cache] 隔离缓存文件失败（{rename_exc}），尝试原地删除。",
+                    file=sys.stderr,
+                )
+                try:
+                    os.remove(src)
+                except OSError:
+                    pass
+        return target
 
     def _apply_pragmas(self) -> None:
         """写侧 PRAGMA。
@@ -330,6 +382,17 @@ class CacheWriter:
         self.set_meta(META_TABLES_SKIPPED, ",".join(skipped))
         self.set_meta(META_LAST_ERROR, error)
         self.set_meta(META_DEGRADED_REASON, degraded_reason)
+        # 收尾时必须把进度推进到终态：否则读者会看到"status=ready 但 phase=building"
+        # 这种自相矛盾的组合，AI 侧可能据此以为还在构建而不敢用缓存。
+        # 保留最后处理的表名/行数（诊断"卡在哪张表"时有用），只改 phase。
+        self._progress = TableProgress(
+            table=self._progress.table,
+            phase="done",
+            rows=self._progress.rows,
+            total=self._progress.total,
+            elapsed_ms=(self._clock() - self._started_at) * 1000.0 if self._started_at else 0.0,
+            peak_rss_mb=self._peak_rss_mb,
+        )
         self._flush_progress(force=True)
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

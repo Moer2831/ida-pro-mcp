@@ -27,6 +27,23 @@ def unload_package(package_name: str):
         del sys.modules[mod_name]
 
 
+_DEBUG_TRACE = bool(os.environ.get("IDA_MCP_DEBUG"))
+
+
+def _trace(message: str) -> None:
+    """启动路径追踪（设 `IDA_MCP_DEBUG=1` 才输出）。
+
+    走 stdout：会进 IDA 的 Output 窗口，`ida.exe -L<log>` 也能读到 —— 专为诊断
+    "IDA 启动即卡死 / 卡在某一步"这类问题准备（哪句是最后一条，就卡在那句之后）。
+    """
+    if not _DEBUG_TRACE:
+        return
+    try:
+        print(f"[MCP] trace: {message}", flush=True)
+    except Exception:  # noqa: BLE001 - 诊断输出绝不能影响插件
+        pass
+
+
 def _generate_instance_id() -> str:
     """生成实例 ID，基于进程 ID"""
     return f"ida-{os.getpid()}"
@@ -124,10 +141,13 @@ class MCP(idaapi.plugin_t):
         def auto_connect_timer():
             if not self._auto_connect_tried:
                 self._auto_connect_tried = True
+                _trace("自动连接定时器触发")
                 self._try_connect(silent=True)
+                _trace("自动连接定时器返回")
             return -1
 
         idaapi.register_timer(500, auto_connect_timer)
+        _trace("init 完成（定时器已注册）")
 
         # 缓存守护线程的生命周期由**主循环定时器**轮询驱动（不在 IDB 钩子里做任何注册）：
         # 曾经在 IDB_Hooks.loaded() 里 register_timer，导致 IDA 启动即死锁 —— 加载序列
@@ -142,7 +162,20 @@ class MCP(idaapi.plugin_t):
 
         def cache_supervisor_timer():
             try:
+                before = self._idb_path_for_cache
                 self._sync_cache_daemon()
+                # 统一刷新"IDA 是否空闲"：定时器只在这里注册一次（init），
+                # 守护线程启动路径绝不注册定时器（那会锁死主线程）
+                try:
+                    from broker import sqlite_cache as _cache_module
+
+                    _cache_module.refresh_idle_states()
+                except Exception:  # noqa: BLE001
+                    pass
+                if self._idb_path_for_cache != before:
+                    _trace(
+                        f"缓存监督定时器 -> idb={self._idb_path_for_cache or '(无)'}"
+                    )
             except Exception:  # noqa: BLE001 - 定时器回调绝不能抛
                 pass
             return 1000
@@ -187,6 +220,7 @@ class MCP(idaapi.plugin_t):
 
     def _try_connect(self, silent: bool = False):
         """尝试连接到 MCP 服务器（后台线程执行，不阻塞 UI）"""
+        _trace("_try_connect 开始")
         if self._connecting:
             if not silent:
                 print("[MCP] 正在连接中，请稍候...")
@@ -199,6 +233,7 @@ class MCP(idaapi.plugin_t):
         
         # 在 UI 线程准备参数
         unload_package("ida_mcp")
+        _trace("unload_package 完成")
         
         if TYPE_CHECKING:
             from .ida_mcp import (
@@ -217,6 +252,7 @@ class MCP(idaapi.plugin_t):
                 set_auto_reconnect,
             )
 
+        _trace("ida_mcp 导入完成")
         set_auto_reconnect(True)
         self._mcp_server = MCP_SERVER
 
@@ -230,7 +266,9 @@ class MCP(idaapi.plugin_t):
             arch_info["idb_path"] = idb_path
 
         # 启动 SQLite 静态缓存后台守护线程（与 Broker 连接解耦，打开 IDB 即开始构建）
+        _trace(f"准备建立缓存监督 idb={idb_path or '(无)'}")
         self._ensure_cache_daemon(idb_path)
+        _trace("缓存监督完成")
 
         def handle_mcp_request(request: dict) -> dict:
             """处理来自服务器的 MCP 请求。

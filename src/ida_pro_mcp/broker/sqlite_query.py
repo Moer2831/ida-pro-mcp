@@ -492,11 +492,38 @@ def entity_query(
     )
 
 
-def cache_status(db_path: str) -> CacheStatusResult:
-    """查询缓存元信息；文件不存在时 status='missing'，不会抛错。
+def _unreadable_status(db_path: str, exc: sqlite3.Error) -> CacheStatusResult:
+    """缓存文件存在但不可读时的诊断结果（**不抛错**）。"""
+    return {
+        "exists": True,
+        "db_path": db_path,
+        "status": "error",
+        "meta": {},
+        "strings": 0,
+        "string_xrefs": 0,
+        "functions": 0,
+        "function_xrefs": 0,
+        "globals": 0,
+        "imports": 0,
+        "partial": False,
+        "counts_source": "meta",
+        "last_error": f"{type(exc).__name__}: {exc}",
+        "degraded_reason": "cache-unreadable",
+        "tables_skipped": [],
+        "progress": {},
+    }
 
-    行数优先读 meta 里的 `count_<table>`（O(1)），只有老缓存缺少该键时才回退到
-    `COUNT(*)`（大库上 6 张表各一次全表扫代价很高，而本工具会被频繁调用）。
+
+def cache_status(db_path: str) -> CacheStatusResult:
+    """查询缓存元信息；**任何情况下都不抛错**（诊断工具必须能给出回答）。
+
+    - 文件不存在 → `status='missing'`；
+    - 文件存在但不可读（垃圾字节 / 被截断 / 半个磁盘镜像）→ `status='error'`，
+      原因放在 `last_error` / `degraded_reason` 里。守护线程随后会把这个文件
+      隔离改名并重建（见 `cache_writer.CacheWriter._quarantine`），所以这是
+      自愈过程中的一个瞬时状态，不该让 MCP 工具调用直接失败。
+    - 正常 → 行数优先读 meta 里的 `count_<table>`（O(1)），只有老缓存缺少该键时
+      才回退到 `COUNT(*)`（大库上 6 张表各一次全表扫代价很高，而本工具会被频繁调用）。
     """
     if not os.path.exists(db_path):
         return {
@@ -514,6 +541,19 @@ def cache_status(db_path: str) -> CacheStatusResult:
             "counts_source": "meta",
             "progress": {},
         }
+    try:
+        result = _cache_status_from_db(db_path)
+    except sqlite3.Error as exc:
+        return _unreadable_status(db_path, exc)
+    if not result.get("status") and not result.get("meta"):
+        # 文件在、但没有 meta 也没有数据：属于"还没建过缓存"，不是错误。
+        result["status"] = "empty"
+        result["degraded_reason"] = result.get("degraded_reason") or "not-built"
+    return result
+
+
+def _cache_status_from_db(db_path: str) -> CacheStatusResult:
+    """从存在的缓存文件读取状态（读取失败向上抛 `sqlite3.Error`）。"""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
     try:
@@ -534,7 +574,15 @@ def cache_status(db_path: str) -> CacheStatusResult:
                 except ValueError:
                     pass
             counts_source = "count"
-            row = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()
+            try:
+                row = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()
+            except sqlite3.OperationalError as exc:
+                # 表不存在 = 这份缓存还没建过（或正在建），不是"损坏"：按 0 报。
+                # 其余 OperationalError（锁、IO）照旧上抛。
+                if "no such table" not in str(exc).lower():
+                    raise
+                counts_source = "none"
+                return 0
             return int(row[0]) if row else 0
 
         def _meta_int(key: str, default: int = 0) -> int:

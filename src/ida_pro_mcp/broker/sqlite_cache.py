@@ -554,44 +554,26 @@ def _default_backend_factory() -> Any:
 _backend_factory: Callable[[], Any] = _default_backend_factory
 
 
-def _install_idle_watcher(handle: _DaemonHandle, backend: Any) -> bool:
-    """用 IDA **主线程定时器**维护空闲标志（必须在主线程调用本函数）。
+def refresh_idle_states() -> int:
+    """刷新所有守护线程的"IDA 是否空闲"标志（**必须在 IDA 主线程调用**）。
 
-    此后守护线程只读 `handle.idle_state`，不再派发任何"是否空闲"的请求 ——
-    那正是把 IDA 卡死的循环等待路径（MFF_READ 只在 idle 时执行，而排队的请求又让
-    IDA 一直不算 idle）。
+    由插件在 `init()` 里注册的定时器周期调用。**不要在守护线程启动路径里注册定时器** ——
+    实测：在定时器回调（或 IDB 钩子）里调用 `ida_kernwin.register_timer()` 会把 IDA 主线程
+    锁死（表现为启动即无响应、CPU 零增长）。所以空闲状态由"启动时注册好的那一个定时器"
+    统一刷新，而不是每个守护线程自己注册。
+
+    返回**成功刷新**的守护线程数量（探测抛异常的不计入，但也不影响其它实例）。
     """
-    handle.idle_backend = backend
-
-    def _tick() -> int:
+    with _daemons_lock:
+        handles = [h for h in _daemons.values() if h.idle_backend is not None]
+    refreshed = 0
+    for handle in handles:
         try:
-            handle.idle_state.set_idle(bool(backend.is_idle()))
-        except Exception:  # noqa: BLE001 - 定时器回调绝不能抛
-            pass
-        return IDLE_WATCH_INTERVAL_MS
-
-    try:
-        import ida_kernwin  # type: ignore
-
-        handle.idle_timer_id = int(
-            ida_kernwin.register_timer(IDLE_WATCH_INTERVAL_MS, _tick)
-        )
-        return True
-    except Exception:  # noqa: BLE001 - 无 IDA / 注册失败 → 退化为兜底探测
-        handle.idle_timer_id = -1
-        return False
-
-
-def _uninstall_idle_watcher(handle: _DaemonHandle) -> None:
-    if handle.idle_timer_id < 0:
-        return
-    try:
-        import ida_kernwin  # type: ignore
-
-        ida_kernwin.unregister_timer(handle.idle_timer_id)
-    except Exception:  # noqa: BLE001
-        pass
-    handle.idle_timer_id = -1
+            handle.idle_state.set_idle(bool(handle.idle_backend.is_idle()))
+        except Exception:  # noqa: BLE001 - 单个实例失败不影响其它
+            continue
+        refreshed += 1
+    return refreshed
 
 
 def _probe_idle_once(handle: _DaemonHandle) -> None:
@@ -615,11 +597,13 @@ def _probe_idle_once(handle: _DaemonHandle) -> None:
 def _wait_for_idle(handle: _DaemonHandle) -> bool:
     """等待"可以安全构建"：IDA 空闲，且距上次 IDB 保存信号已过静默窗口。
 
-    本函数**只等待、不派发**（派发才是卡死根因）。stop_event 置位时返回 False。
+    本函数**只等待、不派发**（派发才是卡死根因）。空闲状态由插件在 `init()` 里注册的
+    定时器通过 `refresh_idle_states()` 刷新（`idle_state.ticks` 会递增）；只有在没有任何
+    外部刷新时（无 IDA 的纯 Python 环境 / 单测）才退化为 `MFF_FAST` 兜底探测。
+    stop_event 置位时返回 False。
     """
-    has_timer = handle.idle_timer_id >= 0
     while not handle.stop_event.is_set():
-        if not has_timer:
+        if handle.idle_timer_id < 0 and handle.idle_state.ticks == 0:
             _probe_idle_once(handle)
         if handle.idle_state.is_ready():
             return True
@@ -650,7 +634,7 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
         f"[MCP][cache] 守护线程启动，目标数据库: {handle.db_path} "
         f"(scope={config.scope}, chunk={config.chunk_rows}, "
         f"incremental={int(config.incremental)}, fp={config.fingerprint}, "
-        f"idle_timer={'on' if handle.idle_timer_id >= 0 else 'fallback'})",
+        f"idle_gate=plugin-timer)",
         file=sys.stderr,
     )
 
@@ -733,13 +717,13 @@ def start_cache_daemon(idb_path: str) -> Optional[str]:
             stop_event=threading.Event(),
             force_event=threading.Event(),
         )
-        # 空闲状态由主线程定时器维护（本函数在 IDA 主线程调用）：
-        # 守护线程只读标志，绝不派发"是否空闲"的请求 —— 那是卡死 IDA 的根因。
+        # 空闲状态由插件在 init() 里注册的定时器统一刷新（见 refresh_idle_states）。
+        # **这里绝不能注册定时器**：本函数可能从定时器回调/IDB 钩子里被调用，
+        # 在那些上下文里 register_timer 会锁死 IDA 主线程（实测）。
         try:
             handle.idle_backend = _backend_factory()
-            _install_idle_watcher(handle, handle.idle_backend)
         except Exception as exc:  # noqa: BLE001
-            print(f"[MCP][cache] 空闲监视器安装失败（改用兜底探测）: {exc}", file=sys.stderr)
+            print(f"[MCP][cache] 后端创建失败（改用兜底探测）: {exc}", file=sys.stderr)
         thread = threading.Thread(
             target=_daemon_loop,
             args=(handle,),
@@ -767,18 +751,37 @@ def request_refresh(idb_path: str) -> bool:
     return True
 
 
+def _drop_idb_hook(handle: _DaemonHandle) -> None:
+    """注销保存钩子（必须在 IDA 主线程调用，插件定时器路径满足）。
+
+    为什么必须注销：钩子闭包持有 `handle`（以及线程对象）。不注销的话，每次
+    IDB 切换/插件重载都会在 IDA 里**残留一个仍然会在 `savebase` 时回调的钩子** ——
+    旧钩子会持续对已停止的句柄 `mark_save()`，且钩子对象永不释放（实测切换 A→B
+    后两个钩子同时存活）。这里先清引用再注销：即使 `unhook()` 抛异常也不会重试成
+    二次注销。
+    """
+    hook = handle.idb_hook
+    handle.idb_hook = None
+    if hook is None:
+        return
+    try:
+        hook.unhook()
+    except Exception as exc:  # noqa: BLE001 - 注销失败不应影响停止流程
+        print(f"[MCP][cache] IDB_Hooks 注销失败: {exc}", file=sys.stderr)
+
+
 def stop_cache_daemon(idb_path: str, *, timeout: float = 5.0) -> None:
-    """停止指定守护线程并清理状态。"""
+    """停止指定守护线程并清理状态（幂等）。"""
     with _daemons_lock:
         handle = _daemons.pop(idb_path, None)
     if handle is None:
         return
     handle.stop_event.set()
     handle.force_event.set()  # 唤醒等待
-    _uninstall_idle_watcher(handle)
     thread = handle.thread
     if thread is not None and thread.is_alive():
         thread.join(timeout=timeout)
+    _drop_idb_hook(handle)
 
 
 def daemon_snapshot(idb_path: str) -> dict[str, Any]:

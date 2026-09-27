@@ -1,13 +1,18 @@
-"""静态守卫：源码里不允许出现"未定义的全局名"。
+"""静态守卫：源码里不允许出现"未定义的全局名"与"危险的注册动作"。
 
 `python -m py_compile` 只查语法，像"重构时漏改的旧名字"（例如把 `sys_stderr()` 删了
 却还有调用点）只有在真正执行到那一行时才会炸成 `NameError` —— 本项目就在 IDA 里
 真实炸过一次（缓存守护线程的启动打印）。这里用 `symtable` 做一次全树静态扫描，
 并自带自检用例证明扫描器本身有效（不会把闭包变量误报成未定义）。
+
+后半部分是**结构性守卫**（`ast`）：定时器 / IDB 钩子的注册点必须落在白名单里。
+文本匹配只能守住"已经知道的那个文件"，而事故恰恰是换了个文件、换了个回调再次发生，
+所以这里改成全树扫描 + 白名单 + "回调内禁止注册"三条规则。
 """
 
 from __future__ import annotations
 
+import ast
 import builtins
 import pathlib
 import symtable
@@ -146,8 +151,7 @@ class PluginStartupSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.source = (_SRC_ROOT / "ida_mcp.py").read_text(encoding="utf-8")
 
-    def test_no_idb_hooks_in_plugin_loader(self) -> None:
-        # 注意只检查**代码形态**（导入/调用），注释里提到 IDB_Hooks 不算
+    def test_no_idb_hooks_in_plugin_loader(self) -> None:        # 注意只检查**代码形态**（导入/调用），注释里提到 IDB_Hooks 不算
         self.assertNotIn(
             "ida_idp",
             self.source,
@@ -166,6 +170,166 @@ class PluginStartupSafetyTests(unittest.TestCase):
             "插件初始化不应扫描 sys.path 取版本号（IDA 的 site-packages 很大，会拖慢启动）",
         )
         self.assertNotIn("importlib.metadata.version", self.source)
+
+    def test_daemon_start_path_never_registers_timers(self) -> None:
+        """守护线程启动路径不得注册/注销定时器。
+
+        实测事故：`start_cache_daemon` 里 `register_timer`（从定时器回调 / IDB 钩子里被调用）
+        会把 IDA 主线程锁死 —— 启动即无响应、CPU 零增长。空闲状态改由插件在 init() 里
+        注册的那一个定时器统一刷新（`refresh_idle_states`）。
+        """
+        source = (_SRC_ROOT / "broker" / "sqlite_cache.py").read_text(encoding="utf-8")
+        start = source.index("def start_cache_daemon")
+        end = source.index("def request_refresh")
+        body = source[start:end]
+        # 只检查**代码形态**（带括号的调用），注释里提到不算
+        self.assertNotIn("register_timer(", body, "启动路径不得注册定时器")
+        self.assertNotIn("unregister_timer(", body, "启动路径不得注销定时器")
+
+
+class StructuralGuardTests(unittest.TestCase):
+    """结构性守卫：注册动作必须落在白名单里，且不得发生在内核回调内部。
+
+    为什么不用文本匹配：事故 2、3 是**同一个形状**换了地方再次发生（先是在
+    `IDB_Hooks.loaded()`，后来是在定时器回调里）。文本 `assertNotIn` 只能守住
+    已经知道的那一处；这里改成三条规则，任何新出现的注册点都会让测试失败。
+    """
+
+    # `register_timer` 允许出现的位置（其余一律失败）
+    TIMER_SITE_ALLOWLIST = {
+        # 插件 init() 里注册的两个主循环定时器（唯一的合法注册时机）
+        "ida_mcp.py",
+        # 上游 dbg_start 的一次性兜底定时器：在工具处理函数里注册，不在任何回调内
+        "ida_mcp/api_debug.py",
+    }
+
+    # 允许定义 `IDB_Hooks` 子类（= 注册 IDB 钩子）的文件，必须精确匹配
+    IDB_HOOK_ALLOWLIST = {
+        # 保存 IDB 即唤醒缓存重建；stop_cache_daemon 会注销（见 test_incident_regressions）
+        "broker/sqlite_cache.py",
+        # 保存/关库时 flush 调用记录；shutdown() 会注销
+        "ida_mcp/trace.py",
+    }
+
+    TIMER_CALLS = frozenset({"register_timer", "unregister_timer"})
+
+    def _sources(self) -> list[tuple[str, pathlib.Path]]:
+        out: list[tuple[str, pathlib.Path]] = []
+        for path in sorted(_SRC_ROOT.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            out.append((str(path.relative_to(_SRC_ROOT)).replace("\\", "/"), path))
+        return out
+
+    def _tree(self, path: pathlib.Path) -> ast.Module:
+        return ast.parse(path.read_text(encoding="utf-8"), str(path))
+
+    @staticmethod
+    def _called_names(node: ast.AST) -> set[str]:
+        names: set[str] = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            func = child.func
+            if isinstance(func, ast.Attribute):
+                names.add(func.attr)
+            elif isinstance(func, ast.Name):
+                names.add(func.id)
+        return names
+
+    def test_broker_never_imports_ida_at_module_scope(self) -> None:
+        """`broker/` 必须能在没有 IDA 的进程里 import（MCP 服务器 / CI / 单测）。
+
+        模块级 `import ida_*` 会让 broker 在纯 Python 环境直接 ImportError，
+        所以 IDA 依赖必须写在函数内部（惰性导入）。
+        """
+        offenders: dict[str, list[str]] = {}
+        for rel, path in self._sources():
+            if not rel.startswith("broker/"):
+                continue
+            tree = self._tree(path)
+            found: list[str] = []
+            for node in tree.body:  # 只看模块作用域
+                if isinstance(node, ast.Import):
+                    found += [a.name for a in node.names if a.name.split(".")[0].startswith("ida")]
+                elif (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module
+                    and node.module.split(".")[0].startswith("ida")
+                ):
+                    found.append(node.module)
+            if found:
+                offenders[rel] = found
+        self.assertEqual(offenders, {}, f"broker 模块级导入了 IDA（应改为函数内惰性导入）: {offenders}")
+
+    def test_timer_registration_sites_are_allowlisted(self) -> None:
+        sites: dict[str, int] = {}
+        for rel, path in self._sources():
+            tree = self._tree(path)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name in self.TIMER_CALLS:
+                    sites[rel] = sites.get(rel, 0) + 1
+        unknown = sorted(set(sites) - self.TIMER_SITE_ALLOWLIST)
+        self.assertEqual(
+            unknown,
+            [],
+            f"新的定时器注册点 {unknown} —— 在定时器回调/IDB 钩子里注册会锁死 IDA 主线程，"
+            "确认安全后加入白名单并说明理由",
+        )
+        self.assertTrue(sites, "预期插件里存在定时器注册（白名单失效？）")
+
+    def test_idb_hook_sites_are_allowlisted(self) -> None:
+        sites: set[str] = set()
+        for rel, path in self._sources():
+            tree = self._tree(path)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                bases = {
+                    (b.attr if isinstance(b, ast.Attribute) else getattr(b, "id", ""))
+                    for b in node.bases
+                }
+                if "IDB_Hooks" in bases:
+                    sites.add(rel)
+        self.assertEqual(
+            sites,
+            self.IDB_HOOK_ALLOWLIST,
+            "IDB 钩子注册点发生变化：多一个就是泄漏/死锁风险，少一个要同步更新白名单",
+        )
+
+    def test_no_registration_inside_idb_callbacks(self) -> None:
+        """事故 2/3 的精确形状：在 IDB 回调里注册定时器/钩子 → 主线程锁死。"""
+        offenders: dict[str, list[str]] = {}
+        for rel, path in self._sources():
+            tree = self._tree(path)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                bases = {
+                    (b.attr if isinstance(b, ast.Attribute) else getattr(b, "id", ""))
+                    for b in node.bases
+                }
+                if "IDB_Hooks" not in bases:
+                    continue
+                for item in node.body:
+                    if not isinstance(item, ast.FunctionDef):
+                        continue
+                    called = self._called_names(item) & (
+                        self.TIMER_CALLS | {"hook", "unhook"}
+                    )
+                    if called:
+                        offenders.setdefault(rel, []).append(
+                            f"{node.name}.{item.name}: {sorted(called)}"
+                        )
+        self.assertEqual(
+            offenders,
+            {},
+            f"IDB 回调内禁止注册定时器/钩子（会锁死 IDA 主线程）: {offenders}",
+        )
 
 
 if __name__ == "__main__":

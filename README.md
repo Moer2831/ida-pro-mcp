@@ -603,13 +603,25 @@ uv pip install -e .
 
 **Q：IDA 一启动（打开上次的数据库）就卡死、界面无响应？**
 
-**2.1.1 有这个问题**（2.1.2 已修）：它在 `IDB_Hooks.loaded()` 里 `register_timer()`，
-而 `loaded()` 处于**数据库加载序列内部**，在那里注册 UI 定时器会锁死主线程 ——
-特征是"CPU 零增长、`.i64` 已解包但界面不动、Broker 里看不到实例"。
+**2.1.1 / 2.1.2 出现过两次同类问题**（2.1.3 已彻底修）：一次是在 `IDB_Hooks.loaded()`
+里 `register_timer()`，另一次是在**定时器回调内部**再 `register_timer()`。
+`loaded()` 处于**数据库加载序列内部**、定时器回调又跑在主循环里，这两个上下文里注册
+UI 定时器都会锁死主线程 —— 特征是"CPU 零增长、`.i64` 已解包但界面不动、Broker 里看不到实例"。
 
-2.1.2 起插件**不再注册任何 IDB 钩子**，缓存生命周期由 `init()` 注册的主循环定时器
-（1s）轮询驱动。判断是否已升级：Output 首行应为
+2.1.3 起**注册动作只允许发生在插件 `init()` 这一条路径上**：缓存生命周期由 `init()` 注册的
+主循环定时器（1s）轮询驱动，守护线程的启动路径零内核副作用。这条约束现在由
+`tests/test_static_sanity.py`（全树 AST + 白名单）与 `tests/test_incident_regressions.py`
+（假 IDA 内核记录 `register_timer`/`IDB_Hooks` 调用）双重看住。
+判断是否已升级：Output 首行应为
 `[MCP] 插件代码: <目录> (装载器 <时间>, 缓存 schema v2)`。
+
+**Q：缓存库文件损坏（断电 / 磁盘写满 / 强杀 IDA）之后怎么办？**
+
+2.1.3 起**无需手工处理**：守护线程发现文件不可用（`file is not a database` /
+`database disk image is malformed`）会把它改名隔离成 `<库名>.corrupt-<时间戳>` 保留取证，
+然后按需重建；`cache_status` 这类诊断工具在文件不可读时也只会返回
+`status=error` + `degraded_reason=cache-unreadable`，不再把 SQLite 异常抛给 AI。
+若看到 `status=empty`（`degraded_reason=not-built`），那只是"这份缓存还没建过"，不是损坏。
 
 **Q：保存 IDB（Ctrl+S）时 IDA 无响应 / 卡死？**
 
