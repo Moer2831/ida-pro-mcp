@@ -94,6 +94,17 @@ class MCP(idaapi.plugin_t):
     wanted_hotkey = "Ctrl-Alt-M"
 
     def init(self):
+        # 一眼可辨"当前跑的是哪份代码"：插件目录里是拷贝还是活链接、缓存 schema 是几版
+        try:
+            import broker.cache_writer as _cache_writer
+
+            print(
+                f"[MCP] 插件代码: {os.path.dirname(os.path.abspath(__file__))} "
+                f"(缓存 schema v{_cache_writer.SCHEMA_VERSION})"
+            )
+        except Exception:
+            pass
+
         self._connected = False
         self._connecting = False  # 正在连接中标志，防止重复连接
         self._mcp_server = None
