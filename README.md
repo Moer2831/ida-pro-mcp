@@ -22,6 +22,7 @@
 - **idalib 无头模式**：通过 `idalib-mcp` 运行纯 headless 服务，支持 `--isolated-contexts` 做严格的每连接上下文隔离。
 - **stdio 端自动拉起 Broker（本仓库新增）**：MCP 客户端（Cursor / Grok / Claude / VS Code…）以 stdio 启动本进程时，若本机没有监听中的 Broker，会自动用隐藏窗口（Windows `Start-Process -WindowStyle Hidden`）/ 独立会话（POSIX `start_new_session=True`）拉起一个，避免"忘记先开 Broker"导致 `instance_list` 为空；该行为只对回环地址生效（`127.0.0.1` / `localhost` / `::1`），远程 Broker 不会被自动拉起，可用 `--no-auto-broker` 关闭。
 - **大库内存重写（2.1.0）**：缓存构建从"整库物化成 Python 对象 + 单事务全量重写"改为**分块流式提取 + 影子表原子切换 + 表级指纹增量**，峰值内存 O(全库) → O(块)，且块间让出 IDA 主线程不再卡界面；查询侧补齐 `ea` 索引、去掉多余的 `COUNT(*)` 全表扫描。完整清单见 [CHANGELOG.md](./CHANGELOG.md)。
+- **零操作自启（2.1.0）**：缓存守护线程的生命周期绑定"当前 IDB"（`IDB_Hooks.loaded` 起、`closebase` 停），与是否连上 Broker 解耦 —— **打开 IDB 就开始建缓存，不需要按 Ctrl+Alt+M，也不需要设任何环境变量**；重连 Broker 也不会打断正在进行的构建。
 
 ---
 
@@ -536,6 +537,8 @@ uv pip install -e .
   指纹未变则整组跳过写库。
 - 触发时机仍是三个：插件连接 Broker 后首次 IDA idle、**每次保存 IDB**
   （`IDB_Hooks.savebase()`）、30 分钟兜底轮询（IDB `mtime` 未变则跳过）。
+  守护线程本身在**打开 IDB 时**就会启动（`IDB_Hooks.loaded`），关闭库时停止，
+  与 Broker 连接无关 —— 所以默认用法下你什么都不用做。
 - 缓存文件写在 IDB 旁边（`<xxx.i64>.mcp.sqlite` 及 `-wal` / `-shm`）；
   构建结束会做一次 `wal_checkpoint(TRUNCATE)`，WAL 不会长期留着。
 

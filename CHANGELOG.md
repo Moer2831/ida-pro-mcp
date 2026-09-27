@@ -41,6 +41,11 @@
   （RSS 读数零依赖实现，Windows 走 psapi / POSIX 走 `/proc/self/statm`）。
 - **scope 收窄的正确性**：从 `full` 切到 `minimal` 会清空范围外的表（含指纹），
   避免继续返回上一轮的**过期**交叉引用；切回 `full` 时会重新填充。
+- **零操作自启**：缓存守护线程的生命周期改为绑定"当前 IDB"
+  （`IDB_Hooks.loaded` 起、`closebase` 停，实现在 `broker/cache_autostart.py`），
+  不再依赖"是否连上 Broker"。历史行为是"IDA 启动时没开库 → 自动连接时 `idb_path`
+  为空 → 之后打开库也不会建缓存"，必须手动按一次 `Ctrl+Alt+M`；现在打开 IDB 即开始构建，
+  且重连 Broker 不会打断正在进行的构建。
 - **观测性**：`cache_status` 新增 `progress`（阶段/表/已处理行/耗时/峰值 RSS/
   refreshing/build_id）、`partial`、`last_error`、`degraded_reason`、`tables_skipped`、
   `counts_source`、`schema_version`；schema 版本升到 2，旧缓存会被自动丢弃重建。

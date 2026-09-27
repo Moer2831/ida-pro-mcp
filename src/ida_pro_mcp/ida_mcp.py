@@ -104,10 +104,64 @@ class MCP(idaapi.plugin_t):
             if not self._auto_connect_tried:
                 self._auto_connect_tried = True
                 self._try_connect(silent=True)
+                # IDA 启动时可能已经恢复了上次的数据库，这里补一次确保缓存开建
+                self._ensure_cache_daemon()
             return -1
 
         idaapi.register_timer(500, auto_connect_timer)
+
+        # 把缓存守护线程绑定到"当前 IDB"：打开库即开始建缓存，与是否连上 Broker 解耦，
+        # 用户不需要任何额外操作（历史上必须先连 Broker 才会建缓存）。
+        self._cache_supervisor = None
+        self._cache_hook = None
+        try:
+            from broker.cache_autostart import CacheDaemonSupervisor
+
+            self._cache_supervisor = CacheDaemonSupervisor()
+        except Exception as _e:  # noqa: BLE001
+            print(f"[MCP] 缓存监督器初始化失败: {_e}")
+        self._install_idb_hooks()
         return idaapi.PLUGIN_KEEP
+
+    def _install_idb_hooks(self):
+        """安装 IDB 生命周期钩子：loaded() 起缓存、closebase() 停缓存。"""
+        try:
+            import ida_idp
+
+            plugin = self
+
+            class _CacheLifecycleHook(ida_idp.IDB_Hooks):
+                def loaded(self, *_args):
+                    plugin._ensure_cache_daemon()
+                    return 0
+
+                def closebase(self):
+                    plugin._stop_cache_daemon()
+                    return 0
+
+            hook = _CacheLifecycleHook()
+            hook.hook()
+            self._cache_hook = hook
+        except Exception as _e:  # noqa: BLE001
+            print(f"[MCP] IDB 生命周期钩子安装失败: {_e}")
+
+    def _ensure_cache_daemon(self, idb_path: str = ""):
+        """确保当前 IDB 的缓存守护线程在跑，并记录 idb_path 供拦截层使用。"""
+        supervisor = getattr(self, "_cache_supervisor", None)
+        if supervisor is None:
+            return
+        path = idb_path or _get_current_idb_path()
+        if not path:
+            return
+        supervisor.ensure(path)
+        # 无论缓存是否被禁用都记录路径：拦截层据此给出准确报错（-32001 而非"未提供 idb_path"）
+        self._idb_path_for_cache = path
+
+    def _stop_cache_daemon(self):
+        supervisor = getattr(self, "_cache_supervisor", None)
+        if supervisor is not None:
+            supervisor.stop()
+        self._idb_path_for_cache = ""
 
     def run(self, arg):
         """手动连接/重连（Ctrl+Alt+M）"""
@@ -157,20 +211,8 @@ class MCP(idaapi.plugin_t):
         if idb_path:
             arch_info["idb_path"] = idb_path
 
-        # 启动 SQLite 静态缓存后台守护线程（实现位于 broker 子目录，按 IDA 插件加载惯例走绝对 import）
-        if idb_path:
-            try:
-                if TYPE_CHECKING:
-                    from .broker import sqlite_cache as _mcp_sqlite_cache
-                else:
-                    from broker import sqlite_cache as _mcp_sqlite_cache
-                _mcp_sqlite_cache.start_cache_daemon(idb_path)
-                self._idb_path_for_cache = idb_path
-            except Exception as _e:
-                print(f"[MCP] SQLite 缓存守护线程启动失败: {_e}")
-                self._idb_path_for_cache = ""
-        else:
-            self._idb_path_for_cache = ""
+        # 启动 SQLite 静态缓存后台守护线程（与 Broker 连接解耦，打开 IDB 即开始构建）
+        self._ensure_cache_daemon(idb_path)
 
         def handle_mcp_request(request: dict) -> dict:
             """处理来自服务器的 MCP 请求。
@@ -240,7 +282,11 @@ class MCP(idaapi.plugin_t):
         thread.start()
 
     def _disconnect(self):
-        """断开与服务器的连接"""
+        """断开与服务器的连接。
+
+        注意：缓存守护线程**不在这里停止** —— 它与 IDB 生命周期绑定
+        （见 `closebase` / `term`），重连 Broker 不应该打断正在进行的缓存构建。
+        """
         if not self._connected:
             return
 
@@ -255,20 +301,14 @@ class MCP(idaapi.plugin_t):
         except Exception:
             pass
 
-        # 顺带停止该 IDB 对应的 SQLite 缓存守护线程
-        target = getattr(self, "_idb_path_for_cache", "") or ""
-        if target:
-            try:
-                if TYPE_CHECKING:
-                    from .broker import sqlite_cache as _mcp_sqlite_cache
-                else:
-                    from broker import sqlite_cache as _mcp_sqlite_cache
-                _mcp_sqlite_cache.stop_cache_daemon(target)
-            except Exception:
-                pass
-        self._idb_path_for_cache = ""
-
     def term(self):
+        self._stop_cache_daemon()
+        try:
+            if getattr(self, "_cache_hook", None) is not None:
+                self._cache_hook.unhook()
+                self._cache_hook = None
+        except Exception:
+            pass
         self._disconnect()
 
 

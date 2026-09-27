@@ -188,5 +188,56 @@ class DaemonApiTests(unittest.TestCase):
         self.assertIsNone(sqlite_cache.resolve_cache_path(""))
 
 
+class PluginLifecycleTests(unittest.TestCase):
+    """插件入口的缓存生命周期接线（需要 IDA：`ida_mcp.py` 顶层 import idaapi）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not os.environ.get("IDADIR"):
+            raise unittest.SkipTest("需要 IDADIR")
+        # idalib 必须先加载：它才会把 IDA 自带的 python 目录接进 sys.path，
+        # 否则 `import idaapi`（插件入口的顶层依赖）会失败。
+        try:
+            import idapro  # type: ignore  # noqa: F401
+        except Exception as exc:  # noqa: BLE001
+            raise unittest.SkipTest(f"idalib 不可用: {exc}")
+
+        import importlib.util
+
+        plugin_path = _REPO_ROOT / "src" / "ida_pro_mcp" / "ida_mcp.py"
+        spec = importlib.util.spec_from_file_location("_ida_mcp_plugin_under_test", plugin_path)
+        if spec is None or spec.loader is None:
+            raise unittest.SkipTest("无法加载插件入口模块")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cls.plugin_module = module
+
+    def test_plugin_exposes_cache_lifecycle_hooks(self) -> None:
+        plugin_cls = self.plugin_module.MCP
+        for attr in ("_ensure_cache_daemon", "_stop_cache_daemon", "_install_idb_hooks"):
+            self.assertTrue(hasattr(plugin_cls, attr), f"插件缺少 {attr}")
+
+    def test_idb_hooks_can_be_installed_and_removed(self) -> None:
+        import ida_idp
+
+        events: list[str] = []
+
+        class _Hook(ida_idp.IDB_Hooks):
+            def loaded(self, *_args):
+                events.append("loaded")
+                return 0
+
+            def closebase(self):
+                events.append("closebase")
+                return 0
+
+        hook = _Hook()
+        hook.hook()
+        try:
+            self.assertIsNotNone(hook)
+        finally:
+            hook.unhook()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
