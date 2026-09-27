@@ -634,35 +634,16 @@ UI 定时器都会锁死主线程 —— 特征是"CPU 零增长、`.i64` 已解
 若仍遇到卡顿，请把 Output 窗口里的 `[MCP][cache] 派发耗时 ...ms` 警告与
 `cache_status` 的 `progress`/`pauses`/`slow_dispatches` 一起反馈，便于定位。
 
-**Q：工具调用报 `Method 'xxx' not found`（工具名找不到）？**
+**Q：工具调用报 `Method 'xxx' not found`？**
 
-几乎都是**客户端缓存的工具表过期**：MCP 客户端只在会话开始时拉一次 `tools/list`，
-之后插件升级/工具改名，旧会话里的名字就再也对不上了。实测踩到：本项目的实例扫描工具
-从 `list_instances` 改名为 `discover_local_instances`、实例切换从 `select_instance`
-改为 `redirect_to_instance`，已在运行的会话调用旧名直接失败。
+MCP 客户端只在会话开始时读一次工具列表，插件升级改名后旧会话就对不上了。
+重连一次即可（重启客户端，或 IDA 里按 `Ctrl+Alt+M`）；也可以直接用当前名字：
+实例列表 `instance_list`、实例切换 `redirect_to_instance`（旧名 `select_instance` 仍可用）。
 
-处理办法（任选）：
+**Q：`discover_local_instances` 返回空列表？**
 
-- 重新建立 MCP 会话（重启客户端 / 重连插件：IDA 里按 `Ctrl+Alt+M`）；
-- 或直接用当前名字：实例列表用无参 `instance_list`（Broker 注册表，权威），
-  本机扫描用 `discover_local_instances`，切换实例用 `redirect_to_instance`；
-- 旧名已保留**兼容别名**（`list_instances` / `select_instance`），短期内调用旧名也能工作。
-
-2.1.6 起该错误消息会附带"刷新 tools/list 或改用当前名字"的提示与可用方法示例，
-不再是一句干巴巴的 `Method not found`。
-
-> 小提示：`redirect_to_instance(port=0)`（旧名 `select_instance`）复位成功返回
-> `Reset to local instance (127.0.0.1)`。以前这里显示 `127.0.0.1:None`：Broker 架构下
-> 插件不上报本地监听端口，`_LOCAL_PORT` 恒为 `None`。功能一直正常，只是输出看着像故障，
-> 2.1.6 已改为按实际情况措辞。
-
-**Q：`discover_local_instances` 返回空列表（明明有 IDA 在跑）？**
-
-这是正常的：该工具扫描的是**旧的文件注册表** `~/.ida-pro-mcp/instances/instance_*.json`，
-而当前架构下实例是注册到 Broker 的 HTTP/SSE 上，这个目录通常是空的。
-查实例请用**无参 `instance_list`**（Broker 注册表）。
-2.1.6 起该工具**始终把"当前正在处理本次调用的实例"放进结果**（`source: "current"`），
-所以不会再出现"看起来一个实例都没有"的误导结果。
+正常。它查的是旧版的文件注册表（`~/.ida-pro-mcp/instances/`），而新版实例都注册在 Broker 上，
+那个目录是空的。**查实例请用 `instance_list`**。
 
 **Q：改了仓库代码，但 IDA 行为没变？**
 
