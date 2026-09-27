@@ -97,13 +97,18 @@ class DefineResult(TypedDict, total=False):
 # ============================================================================
 
 
-def _lvar_name_exists(func_ea: int, name: str) -> bool:
-    """反编译后回读，确认局部变量名真的存在（用于校验 rename_lvar 是否落库）。
+def _lvar_name_exists(func_ea: int, name: str, *, force_rebuild: bool = False) -> bool:
+    """反编译后回读，确认局部变量名真的存在（用于校验改名是否**落库**）。
 
     实测坑：`ida_hexrays.rename_lvar()` 返回 True 但名字没落到数据库 ——
-    形参改名回退时报告 ok，重启 IDB 后仍是旧名；有时还会把形参一起改名成 `xxx_1`。
-    所以调用方必须回读校验，把"报 ok 但没改"变成显式错误。
+    改名后当下能看到（改的是内存里的 cfunc），下一次反编译/被别的操作触发重建
+    cfunc 就退回旧名；形参还会被顺带改名成 `xxx_1`。工具报 ok 而实际没改比报错更糟。
     """
+    if force_rebuild:
+        try:
+            ida_hexrays.mark_cfunc_dirty(func_ea, False)
+        except Exception:  # noqa: BLE001 - 老版本没有该 API 时退化为直接反编译
+            pass
     try:
         cfunc = ida_hexrays.decompile(func_ea)
     except Exception:  # noqa: BLE001 - 反编译失败即视为未生效
@@ -114,6 +119,48 @@ def _lvar_name_exists(func_ea: int, name: str) -> bool:
         return any(getattr(lv, "name", "") == name for lv in cfunc.get_lvars())
     except Exception:  # noqa: BLE001
         return False
+
+
+def _lvar_rename_persisted(func_ea: int, old_name: str, new_name: str) -> bool:
+    """改局部变量名并**持久化**，返回是否真的生效。
+
+    `rename_lvar()` 只改当前 cfunc（不写库）；正确做法是 `modify_user_lvars()` ——
+    官方说明是"Modify **saved** local variable settings"。先走它，失败再退回
+    `rename_lvar()`，最后强制重建 cfunc 回读确认。
+    """
+
+    class _Renamer(ida_hexrays.user_lvar_modifier_t):  # type: ignore[misc]
+        def __init__(self) -> None:
+            super().__init__()
+            self.changed = False
+
+        def modify_lvars(self, lvinf) -> bool:  # noqa: ANN001
+            try:
+                lvars = list(lvinf.lvars)
+            except Exception:  # noqa: BLE001
+                return False
+            for lv in lvars:
+                if getattr(lv, "name", "") == old_name:
+                    try:
+                        lv.name = new_name
+                    except Exception:  # noqa: BLE001
+                        return False
+                    self.changed = True
+            return self.changed
+
+    applied = False
+    try:
+        applied = bool(ida_hexrays.modify_user_lvars(func_ea, _Renamer()))
+    except Exception:  # noqa: BLE001 - 退回旧路径
+        applied = False
+    if not applied:
+        try:
+            applied = bool(ida_hexrays.rename_lvar(func_ea, old_name, new_name))
+        except Exception:  # noqa: BLE001
+            applied = False
+    if not applied:
+        return False
+    return _lvar_name_exists(func_ea, new_name, force_rebuild=True)
 
 
 @tool
@@ -600,20 +647,15 @@ def rename(
                 success = True
                 error = None
                 if not dry_run:
-                    success = ida_hexrays.rename_lvar(func.start_ea, old_name, new_name)
-                    if success:
-                        # 回读校验：`rename_lvar()` 会返回成功但名字没落库（实测：
-                        # 形参改名回退报告 ok，重启 IDB 后仍是旧名；有时还会顺带把
-                        # 形参一起改名出 `xxx_1`）。工具报 ok 而实际没改比报错更糟，
-                        # 所以这里必须重新反编译确认新名字真的存在。
-                        success = _lvar_name_exists(func.start_ea, new_name)
-                        if not success:
-                            error = (
-                                f"rename_lvar 返回成功但回读未找到新名字 {new_name!r}"
-                                "（改动未落库，请确认 old 名字是否准确）"
-                            )
-                        else:
-                            refresh_decompiler_ctext(func.start_ea)
+                    success = _lvar_rename_persisted(func.start_ea, old_name, new_name)
+                    if not success:
+                        error = (
+                            f"改名未生效（Hex-Rays 未把 {new_name!r} 落库；"
+                            "已尝试 modify_user_lvars 与 rename_lvar），"
+                            "请确认 old 名字是否准确"
+                        )
+                    else:
+                        refresh_decompiler_ctext(func.start_ea)
                 if not success and error is None:
                     error = "Rename failed"
 

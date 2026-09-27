@@ -21,6 +21,26 @@
 - **防回归**：新增两条静态守卫 —— `IDB_Hooks.savebase()` 内不得出现任何写库动作；
   延迟 flush 必须由主循环定时器驱动（`ida_mcp.py` 调用 `trace.flush_pending()`）。
 
+### 全量实测（在 2.1.5 最终代码上重跑）
+
+写入矩阵在最终版本上逐项复验并逐项还原：`rename`（函数/全局/局部/栈/dry_run）、
+`set_comments`/`append_comments`、`patch`/`put_int`、`declare_type`/`enum_upsert`/
+`declare_stack`/`delete_stack`、`define_code`/`define_func`/`undefine`（往返后
+**字节与原始基线完全一致**）、`set_type`/`type_apply_batch`/`infer_types`；
+缓存层 `cache_status`/`refresh_cache`/`find_regex`/`entity_query`（4 种 kind + `names` 直通）/
+`list_globals`（嵌套 filter+count 生效）/`imports`（count 精确）；两轮
+"写操作 → `idb_save`" 均返回 `ok` 且 IDA 持续 `Responding=True`。
+
+### 实测新发现：局部变量改名不落库
+
+`ida_hexrays.rename_lvar()` 只改内存中的 cfunc（函数返回 True），名字**不写数据库** ——
+改完当场能看到，下一次反编译就退回旧名。现在改为优先调用官方持久化 API
+`modify_user_lvars()`（"Modify **saved** local variable settings"），失败再退回
+`rename_lvar()`，最后**强制重建 cfunc 回读校验**；确实没落库时明确报错
+（`改名未生效（Hex-Rays 未把 'x' 落库…）`），而不是像以前那样返回 ok。
+实测还发现：某些目标名会被 Hex-Rays 拒收（把局部变量改成 `v3` 始终失败，
+改成 `qa_v3` 成功），这属于 IDA 侧行为，工具现在如实回报。
+
 ## 2.1.4
 
 主题：**写入类工具全面实测**（rename / patch / put_int / set_type / define / 注释 / 栈 / 类型 …）
