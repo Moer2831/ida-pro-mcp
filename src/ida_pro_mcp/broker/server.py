@@ -433,7 +433,7 @@ class IDARegistry:
                 client_id = inst.client_id
                 sse_queue = self._sse_queues.get(client_id)
                 if not sse_queue:
-                    self._metrics_fail_locked(f"实例 {instance.instance_id} 没有可用的 SSE 队列")
+                    self._metrics_fail_locked(f"实例 {inst.instance_id} 没有可用的 SSE 队列")
                     return None
                 
                 # 创建请求跟踪

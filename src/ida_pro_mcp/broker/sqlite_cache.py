@@ -444,9 +444,27 @@ def _run_build_once(
     return stats
 
 
+def _default_backend_factory() -> Any:
+    from .cache_backend import IdaCacheBackend
+
+    return IdaCacheBackend()
+
+
+# 测试可替换（单测注入假后端即可覆盖整个守护线程主循环，不需要 IDA）
+_backend_factory: Callable[[], Any] = _default_backend_factory
+
+
 def _wait_for_idle(handle: _DaemonHandle, backend: Any) -> bool:
-    """轮询等待 IDA 空闲；stop_event 置位时返回 False。"""
-    from .cache_backend import run_on_ida_main
+    """等待 IDA 空闲；stop_event 置位时返回 False。
+
+    无头（idalib）环境直接放行：那里没有交互式分析要避让，而且**从后台线程调用
+    IDAPython 未必可用**（实测 idalib 下守护线程拿不到空闲判定），继续等只会永远
+    建不出缓存。GUI 下仍然按 IDLE_POLL_SEC 轮询等待。
+    """
+    from .cache_backend import is_headless, run_on_ida_main
+
+    if is_headless():
+        return True
 
     while not handle.stop_event.is_set():
         idle = run_on_ida_main(backend.is_idle)
@@ -463,8 +481,6 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
     2. 之后：等待 force_event（IDB 保存 / refresh_cache 工具）或 30 分钟兜底；
        IDB mtime 未变化时跳过重建（除非是被 force 唤醒）。
     """
-    from .cache_backend import IdaCacheBackend
-
     config = load_cache_config()
     if config.disabled:
         print(
@@ -473,12 +489,12 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
         )
         return
 
-    backend = IdaCacheBackend()
+    backend = _backend_factory()
     print(
         f"[MCP][cache] 守护线程启动，目标数据库: {handle.db_path} "
         f"(scope={config.scope}, chunk={config.chunk_rows}, "
         f"incremental={int(config.incremental)}, fp={config.fingerprint})",
-        file=sys_stderr(),
+        file=sys.stderr,
     )
 
     if _wait_for_idle(handle, backend):
@@ -486,7 +502,7 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
             _run_build_once(handle, backend, config)
         except Exception as exc:  # noqa: BLE001
             handle.last_error = str(exc)
-            print(f"[MCP][cache] 构建失败: {exc}", file=sys_stderr())
+            print(f"[MCP][cache] 构建失败: {exc}", file=sys.stderr)
 
     while not handle.stop_event.is_set():
         triggered = handle.force_event.wait(REFRESH_INTERVAL_SEC)
@@ -507,7 +523,7 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
             _run_build_once(handle, backend, config)
         except Exception as exc:  # noqa: BLE001
             handle.last_error = str(exc)
-            print(f"[MCP][cache] 构建失败: {exc}", file=sys_stderr())
+            print(f"[MCP][cache] 构建失败: {exc}", file=sys.stderr)
 
 
 def _make_idb_save_hook(handle: _DaemonHandle) -> Any:
@@ -560,7 +576,7 @@ def start_cache_daemon(idb_path: str) -> Optional[str]:
         try:
             handle.idb_hook = _make_idb_save_hook(handle)
         except Exception as exc:  # noqa: BLE001
-            print(f"[MCP][cache] IDB_Hooks 注册失败: {exc}", file=sys_stderr())
+            print(f"[MCP][cache] IDB_Hooks 注册失败: {exc}", file=sys.stderr)
         _daemons[idb_path] = handle
         thread.start()
 

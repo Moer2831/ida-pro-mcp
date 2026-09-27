@@ -13,7 +13,10 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _cache_fakes import FakeBackend, build_test_db, make_backend  # noqa: E402
@@ -658,6 +661,99 @@ class BuildCacheTests(unittest.TestCase):
         second = _rows(self.db, "SELECT name FROM functions ORDER BY ea")
         self.assertNotEqual(first, second)
         self.assertIn(("changed",), second)
+
+
+class DaemonLoopTests(unittest.TestCase):
+    """守护线程主循环的可执行路径（历史上这里漏改过变量名，只有真跑才会炸）。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="ida-mcp-daemon-")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _handle(self) -> sqlite_cache._DaemonHandle:  # noqa: SLF001
+        return sqlite_cache._DaemonHandle(  # noqa: SLF001
+            idb_path=os.path.join(self.tmp, "x.i64"),
+            db_path=os.path.join(self.tmp, "x.i64.mcp.sqlite"),
+            thread=None,
+            stop_event=threading.Event(),
+            force_event=threading.Event(),
+        )
+
+    def test_disabled_config_returns_without_building(self) -> None:
+        with mock.patch.dict(os.environ, {"IDA_MCP_DISABLE_CACHE": "1"}):
+            handle = self._handle()
+            sqlite_cache._daemon_loop(handle)  # noqa: SLF001
+            self.assertIsNone(handle.last_stats)
+            self.assertFalse(handle.stop_event.is_set())
+
+    def test_start_cache_daemon_respects_disable_switch(self) -> None:
+        with mock.patch.dict(os.environ, {"IDA_MCP_DISABLE_CACHE": "1"}):
+            self.assertIsNone(sqlite_cache.start_cache_daemon(os.path.join(self.tmp, "y.i64")))
+        snapshot = sqlite_cache.daemon_snapshot(os.path.join(self.tmp, "y.i64"))
+        self.assertFalse(snapshot["running"])
+
+
+    def test_daemon_loop_end_to_end_with_fake_backend(self) -> None:
+        """跑完整主循环：启动 → 构建 → 等待 force → 退出（用假后端，秒级完成）。
+
+        注意：这里刻意不用真 IDA —— 守护线程会从后台线程调用 IDA API，而 idalib 下
+        这些调用未必可用（实测拿不到空闲判定）；生产环境里守护线程只在 GUI 插件里跑，
+        走的是 `execute_sync` 派发到主线程。
+        """
+        backend = make_backend()
+        original_factory = sqlite_cache._backend_factory  # noqa: SLF001
+        sqlite_cache._backend_factory = lambda: backend  # noqa: SLF001
+        # 本用例模拟"无 IDA / 无头"进程；其它测试模块可能已 import 过 idapro，
+        # 于是这里显式钉住 headless 判定，保证测试与环境无关。
+        patcher = mock.patch(
+            "ida_pro_mcp.broker.cache_backend.is_headless", lambda: True
+        )
+        patcher.start()
+        try:
+            handle = self._handle()
+            worker = threading.Thread(
+                target=sqlite_cache._daemon_loop,  # noqa: SLF001
+                args=(handle,),
+                daemon=True,
+            )
+            worker.start()
+            deadline = time.time() + 30
+            while time.time() < deadline and handle.last_stats is None and worker.is_alive():
+                time.sleep(0.05)
+
+            self.assertIsNotNone(
+                handle.last_stats,
+                f"守护线程应完成一轮构建（last_error={handle.last_error!r}）",
+            )
+            assert handle.last_stats is not None
+            self.assertEqual(handle.last_stats.status, STATUS_READY, handle.last_stats.reason)
+            self.assertGreater(handle.last_stats.functions, 0)
+            self.assertEqual(handle.builds, 1)
+
+            # 第二次触发（IDB 保存 / refresh_cache）：mtime 未变 + force 唤醒 → 仍会重建一轮
+            handle.force_event.set()
+            deadline = time.time() + 30
+            while time.time() < deadline and handle.builds < 2 and worker.is_alive():
+                time.sleep(0.05)
+            self.assertEqual(handle.builds, 2)
+
+            handle.stop_event.set()
+            handle.force_event.set()
+            worker.join(timeout=15)
+            self.assertFalse(worker.is_alive(), "stop_event 置位后守护线程应退出")
+        finally:
+            sqlite_cache._backend_factory = original_factory  # noqa: SLF001
+            patcher.stop()
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_daemon_snapshot_shape(self) -> None:
+        snapshot = sqlite_cache.daemon_snapshot(r"C:\nope\a.i64")
+        self.assertIn("running", snapshot)
+        self.assertFalse(snapshot["running"])
+        self.assertEqual(snapshot["idb_path"], r"C:\nope\a.i64")
 
 
 if __name__ == "__main__":

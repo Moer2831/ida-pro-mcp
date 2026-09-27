@@ -35,7 +35,9 @@ def is_headless() -> bool:
     try:
         return not bool(ida_kernwin.is_idaq())
     except Exception:  # noqa: BLE001
-        return False
+        # 判定失败时按"无 GUI 可派发"处理：直接调用至少能让缓存建出来，
+        # 而误判成 GUI 会让 execute_sync 拿不到主线程、守护线程永远空等。
+        return True
 
 
 def run_on_ida_main(fn: Callable[[], T]) -> Optional[T]:
@@ -81,17 +83,17 @@ class IdaCacheBackend:
     # -- 空闲判定 ---------------------------------------------------------
 
     def is_idle(self) -> bool:
-        """自动分析完成且 Hex-Rays 就绪才认为 IDA 空闲（沿用历史判定）。"""
+        """自动分析队列清空即视为空闲，可以开始建缓存。
+
+        历史实现还额外要求 Hex-Rays 就绪，但缓存只读 strings / functions / names /
+        imports（`has_type` 走 `ida_nalt.get_tinfo`），**不依赖反编译器**；而在无头
+        idalib 或未安装/未授权 Hex-Rays 的环境里 `init_hexrays_plugin()` 可能始终返回
+        False，会导致守护线程一直空等、缓存永远建不出来（实测踩到）。
+        """
         try:
             import ida_auto  # type: ignore
-            import ida_hexrays  # type: ignore
 
-            auto_ok = bool(ida_auto.auto_is_ok())
-            try:
-                hexrays_ok = bool(ida_hexrays.init_hexrays_plugin())
-            except Exception:  # noqa: BLE001
-                hexrays_ok = False
-            return auto_ok and hexrays_ok
+            return bool(ida_auto.auto_is_ok())
         except Exception:  # noqa: BLE001
             return False
 
