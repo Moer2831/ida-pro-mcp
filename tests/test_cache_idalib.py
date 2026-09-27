@@ -213,9 +213,15 @@ class PluginLifecycleTests(unittest.TestCase):
         cls.plugin_module = module
 
     def test_plugin_exposes_cache_lifecycle_hooks(self) -> None:
+        """插件装载器只暴露"同步/起停"入口；**不得**再注册 IDB 钩子。
+
+        曾经在 `IDB_Hooks.loaded()` 里 `register_timer`，导致 IDA 启动即死锁。
+        """
         plugin_cls = self.plugin_module.MCP
-        for attr in ("_ensure_cache_daemon", "_stop_cache_daemon", "_install_idb_hooks"):
+        for attr in ("_sync_cache_daemon", "_ensure_cache_daemon", "_stop_cache_daemon"):
             self.assertTrue(hasattr(plugin_cls, attr), f"插件缺少 {attr}")
+        source = pathlib.Path(self.plugin_module.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("ida_idp", source, "插件装载器不得导入并注册 IDB 钩子")
 
     def test_idb_hooks_can_be_installed_and_removed(self) -> None:
         import ida_idp

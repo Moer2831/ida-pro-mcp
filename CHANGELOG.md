@@ -4,6 +4,24 @@
 上游来源：[QiuChenly/ida-pro-mcp-enhancement](https://github.com/QiuChenly/ida-pro-mcp-enhancement)
 → [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)。
 
+## 2.1.2
+
+主题：**修复"IDA 一启动就卡死"**（2.1.1 引入的回归）。
+
+- **根因**：2.1.1 把缓存守护线程的启动挂在 `IDB_Hooks.loaded()` 上，并在那里调用
+  `ida_kernwin.register_timer()` 安装空闲监视器。而 `loaded()` 是在**数据库加载序列内部**
+  被调用的 —— 在那时注册 UI 定时器会把主线程锁死，表现为"一启动就无响应"：
+  CPU 零增长、`.i64` 已解包但界面不动、Broker 里看不到实例。
+- **修复**：插件装载器**不再注册任何 IDB 钩子**（`ida_idp` 零导入）；缓存生命周期改由
+  `init()` 里注册的**主循环定时器**（1000ms）轮询驱动 —— 没有库→停、换库→先停再起、
+  同库→幂等，通过 `CacheDaemonSupervisor.sync_to_idb()` 完成。所有注册动作
+  （空闲监视定时器、savebase 钩子、守护线程）都发生在正常主循环上下文里。
+- **插件初始化不再扫描 `sys.path`**：版本横幅改用"装载器 mtime"作为构建指纹
+  （`[MCP] 插件代码: <目录> (装载器 2026-09-28 02:10, 缓存 schema v2)`），
+  避免 `importlib.metadata` 在 IDA 的大 site-packages 上拖慢启动。
+- **测试**：新增 5 项 `sync_to_idb` 用例 + 3 项插件启动路径静态守卫
+  （不得导入 `ida_idp`、不得注册钩子、不得用 `importlib.metadata`），全量 328 项通过。
+
 ## 2.1.1
 
 主题：**修复"保存 IDB 时 IDA 卡死"**（实测事故），并消除两个 API 易用性坑。

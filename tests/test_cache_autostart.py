@@ -134,6 +134,46 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(supervisor.ensure(r"C:\bin\a.i64"), r"C:\bin\a.i64")
 
 
+class SyncToIdbTests(unittest.TestCase):
+    """`sync_to_idb` —— 主循环定时器用它把守护线程同步到当前 IDB（不再用 IDB 钩子）。"""
+
+    def setUp(self) -> None:
+        self.started: list[str] = []
+        self.stopped: list[str] = []
+        self.supervisor = CacheDaemonSupervisor(
+            start=lambda p: (self.started.append(p), p + ".mcp.sqlite")[1],
+            stop=lambda p: self.stopped.append(p),
+            disabled_probe=lambda: False,
+        )
+
+    def test_starts_for_current_db(self) -> None:
+        self.assertEqual(self.supervisor.sync_to_idb(r"C:\bin\a.i64"), r"C:\bin\a.i64")
+        self.assertEqual(self.started, [r"C:\bin\a.i64"])
+        self.assertEqual(self.stopped, [])
+
+    def test_stops_when_no_db_open(self) -> None:
+        self.supervisor.sync_to_idb(r"C:\bin\a.i64")
+        self.assertIsNone(self.supervisor.sync_to_idb(""))
+        self.assertEqual(self.stopped, [r"C:\bin\a.i64"])
+        self.assertEqual(self.supervisor.current_idb, "")
+
+    def test_switches_db(self) -> None:
+        self.supervisor.sync_to_idb(r"C:\bin\a.i64")
+        self.assertEqual(self.supervisor.sync_to_idb(r"C:\bin\b.i64"), r"C:\bin\b.i64")
+        self.assertEqual(self.stopped, [r"C:\bin\a.i64"])
+        self.assertEqual(self.started, [r"C:\bin\a.i64", r"C:\bin\b.i64"])
+
+    def test_idempotent_for_same_db(self) -> None:
+        self.supervisor.sync_to_idb(r"C:\bin\a.i64")
+        self.supervisor.sync_to_idb(r"C:\bin\a.i64")
+        self.assertEqual(self.stopped, [], "同一库重复同步不得停掉正在运行的守护线程")
+
+    def test_handles_none_and_whitespace(self) -> None:
+        self.assertIsNone(self.supervisor.sync_to_idb(None))
+        self.assertIsNone(self.supervisor.sync_to_idb("   "))
+        self.assertEqual(self.started, [])
+
+
 class DefaultWiringTests(unittest.TestCase):
     def test_default_start_stop_use_sqlite_cache(self) -> None:
         with mock.patch.object(

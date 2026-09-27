@@ -133,5 +133,40 @@ class SourceTreeSanityTests(unittest.TestCase):
         )
 
 
+class PluginStartupSafetyTests(unittest.TestCase):
+    """插件启动路径的静态约束（防止再次出现"启动即死锁"）。
+
+    事故：2.1.1 让 `IDB_Hooks.loaded()` 调用 `ida_kernwin.register_timer()` 安装空闲监视器，
+    而 `loaded()` 是在**数据库加载序列内部**被调用的 —— 在那里注册 UI 定时器把主线程锁死：
+    IDA 一启动就无响应、CPU 零增长、Broker 里看不到实例。
+
+    结论：插件装载器不得注册任何 IDB 钩子；缓存生命周期只能由**主循环定时器**驱动。
+    """
+
+    def setUp(self) -> None:
+        self.source = (_SRC_ROOT / "ida_mcp.py").read_text(encoding="utf-8")
+
+    def test_no_idb_hooks_in_plugin_loader(self) -> None:
+        # 注意只检查**代码形态**（导入/调用），注释里提到 IDB_Hooks 不算
+        self.assertNotIn(
+            "ida_idp",
+            self.source,
+            "插件装载器不得导入 ida_idp / 注册 IDB 钩子（在启动路径里注册 = 死锁）",
+        )
+        self.assertNotIn(".hook()", self.source, "插件装载器不得注册任何钩子")
+
+    def test_cache_lifecycle_is_timer_driven(self) -> None:
+        self.assertIn("cache_supervisor_timer", self.source, "缓存生命周期应由主循环定时器轮询驱动")
+        self.assertIn("sync_to_idb", self.source, "定时器应通过 sync_to_idb 同步守护线程")
+
+    def test_no_metadata_scan_at_plugin_init(self) -> None:
+        self.assertNotIn(
+            "from importlib.metadata",
+            self.source,
+            "插件初始化不应扫描 sys.path 取版本号（IDA 的 site-packages 很大，会拖慢启动）",
+        )
+        self.assertNotIn("importlib.metadata.version", self.source)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

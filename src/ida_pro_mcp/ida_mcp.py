@@ -7,6 +7,7 @@
 import os
 import sys
 import threading
+import time
 import idaapi
 import idc
 from typing import TYPE_CHECKING
@@ -94,19 +95,22 @@ class MCP(idaapi.plugin_t):
     wanted_hotkey = "Ctrl-Alt-M"
 
     def init(self):
-        # 一眼可辨"当前跑的是哪份代码"：包版本 + 缓存 schema 版本
+        # 一眼可辨"当前跑的是哪份代码"：代码目录 + 装载器 mtime（构建指纹）+ 缓存 schema
+        # 注意：这里**故意不用 importlib.metadata** —— 它会扫描整个 sys.path
+        # （IDA 的 site-packages 很大），拖慢插件初始化。
         try:
             import broker.cache_writer as _cache_writer
 
+            _loader = os.path.abspath(__file__)
             try:
-                from importlib.metadata import version as _pkg_version
-
-                _version = _pkg_version("ida-pro-mcp")
-            except Exception:
-                _version = "unknown"
+                _stamp = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(_loader))
+                )
+            except OSError:
+                _stamp = "unknown"
             print(
-                f"[MCP] 插件代码: {os.path.dirname(os.path.abspath(__file__))} "
-                f"(v{_version}, 缓存 schema v{_cache_writer.SCHEMA_VERSION})"
+                f"[MCP] 插件代码: {os.path.dirname(_loader)} "
+                f"(装载器 {_stamp}, 缓存 schema v{_cache_writer.SCHEMA_VERSION})"
             )
         except Exception:
             pass
@@ -121,49 +125,46 @@ class MCP(idaapi.plugin_t):
             if not self._auto_connect_tried:
                 self._auto_connect_tried = True
                 self._try_connect(silent=True)
-                # IDA 启动时可能已经恢复了上次的数据库，这里补一次确保缓存开建
-                self._ensure_cache_daemon()
             return -1
 
         idaapi.register_timer(500, auto_connect_timer)
 
-        # 把缓存守护线程绑定到"当前 IDB"：打开库即开始建缓存，与是否连上 Broker 解耦，
-        # 用户不需要任何额外操作（历史上必须先连 Broker 才会建缓存）。
-        self._cache_supervisor = None
-        self._cache_hook = None
+        # 缓存守护线程的生命周期由**主循环定时器**轮询驱动（不在 IDB 钩子里做任何注册）：
+        # 曾经在 IDB_Hooks.loaded() 里 register_timer，导致 IDA 启动即死锁 —— 加载序列
+        # 内部不能碰 UI 定时器/钩子注册，这类动作只能在正常主循环上下文里做。
         try:
             from broker.cache_autostart import CacheDaemonSupervisor
 
             self._cache_supervisor = CacheDaemonSupervisor()
         except Exception as _e:  # noqa: BLE001
+            self._cache_supervisor = None
             print(f"[MCP] 缓存监督器初始化失败: {_e}")
-        self._install_idb_hooks()
+
+        def cache_supervisor_timer():
+            try:
+                self._sync_cache_daemon()
+            except Exception:  # noqa: BLE001 - 定时器回调绝不能抛
+                pass
+            return 1000
+
+        idaapi.register_timer(1000, cache_supervisor_timer)
         return idaapi.PLUGIN_KEEP
 
-    def _install_idb_hooks(self):
-        """安装 IDB 生命周期钩子：loaded() 起缓存、closebase() 停缓存。"""
-        try:
-            import ida_idp
+    def _sync_cache_daemon(self):
+        """把缓存守护线程同步到"当前打开的 IDB"（在主循环定时器里调用）。
 
-            plugin = self
-
-            class _CacheLifecycleHook(ida_idp.IDB_Hooks):
-                def loaded(self, *_args):
-                    plugin._ensure_cache_daemon()
-                    return 0
-
-                def closebase(self):
-                    plugin._stop_cache_daemon()
-                    return 0
-
-            hook = _CacheLifecycleHook()
-            hook.hook()
-            self._cache_hook = hook
-        except Exception as _e:  # noqa: BLE001
-            print(f"[MCP] IDB 生命周期钩子安装失败: {_e}")
+        - 没有库 → 停掉守护线程；
+        - 换了库 → 先停旧的再起新的；
+        - 同一个库 → 幂等（`ensure` 内部去重）。
+        """
+        supervisor = getattr(self, "_cache_supervisor", None)
+        if supervisor is None:
+            return
+        supervisor.sync_to_idb(_get_current_idb_path())
+        self._idb_path_for_cache = supervisor.current_idb
 
     def _ensure_cache_daemon(self, idb_path: str = ""):
-        """确保当前 IDB 的缓存守护线程在跑，并记录 idb_path 供拦截层使用。"""
+        """确保当前 IDB 的缓存守护线程在跑（供连接路径 Ctrl+Alt+M 调用）。"""
         supervisor = getattr(self, "_cache_supervisor", None)
         if supervisor is None:
             return
@@ -172,7 +173,7 @@ class MCP(idaapi.plugin_t):
             return
         supervisor.ensure(path)
         # 无论缓存是否被禁用都记录路径：拦截层据此给出准确报错（-32001 而非"未提供 idb_path"）
-        self._idb_path_for_cache = path
+        self._idb_path_for_cache = supervisor.current_idb
 
     def _stop_cache_daemon(self):
         supervisor = getattr(self, "_cache_supervisor", None)
@@ -319,13 +320,8 @@ class MCP(idaapi.plugin_t):
             pass
 
     def term(self):
+        # 只停守护线程与连接；插件不再注册任何 IDB 钩子（见 init() 的说明）
         self._stop_cache_daemon()
-        try:
-            if getattr(self, "_cache_hook", None) is not None:
-                self._cache_hook.unhook()
-                self._cache_hook = None
-        except Exception:
-            pass
         self._disconnect()
 
 

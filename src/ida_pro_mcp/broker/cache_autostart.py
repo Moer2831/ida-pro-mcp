@@ -82,6 +82,22 @@ class CacheDaemonSupervisor:
         except Exception:  # noqa: BLE001
             pass
 
+    def sync_to_idb(self, current_idb_path: Optional[str]) -> Optional[str]:
+        """把守护线程同步到"当前打开的 IDB"（由主循环定时器调用，幂等）。
+
+        - 路径为空（没有库）→ 停掉守护线程；
+        - 路径与当前绑定不同 → `ensure` 内部先停旧的再起新的；
+        - 路径相同 → 幂等，不重复起停。
+
+        返回当前绑定的 IDB 路径（无库时为 None）。
+        """
+        path = (current_idb_path or "").strip()
+        if not path:
+            self.stop()
+            return None
+        self.ensure(path)
+        return self._current_idb
+
     def snapshot(self) -> dict[str, Any]:
         """诊断快照（供日志/问题定位）。"""
         cache_db = _cache.resolve_cache_path(self._current_idb) if self._current_idb else None
