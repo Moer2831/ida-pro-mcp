@@ -172,6 +172,14 @@ class MCP(idaapi.plugin_t):
                     _cache_module.refresh_idle_states()
                 except Exception:  # noqa: BLE001
                     pass
+                # 调用记录（trace）的落盘：savebase 钩子只置标志，真正的 netnode 写入
+                # 在这里做 —— 保存序列内部写 IDB 会与保存流程循环等待（实测卡死）。
+                try:
+                    import ida_mcp as _ida_mcp_pkg
+
+                    _ida_mcp_pkg.trace.flush_pending()
+                except Exception:  # noqa: BLE001
+                    pass
                 if self._idb_path_for_cache != before:
                     _trace(
                         f"缓存监督定时器 -> idb={self._idb_path_for_cache or '(无)'}"

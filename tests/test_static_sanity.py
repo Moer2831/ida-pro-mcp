@@ -332,5 +332,60 @@ class StructuralGuardTests(unittest.TestCase):
         )
 
 
+    def test_idb_savebase_never_writes_the_database(self) -> None:
+        """事故：`trace` 的 `savebase()` 在**保存序列内部**写 netnode，导致保存后 IDA 死等。
+
+        症状：`.i64` 已写盘、但 `Responding=False`、CPU 冻结、全部线程 Wait，
+        随后所有需要主线程的工具（`idb_save` 等）全部超时。
+        规则：`IDB_Hooks.savebase()` 里只允许置标志，不得调用任何写库动作。
+        """
+        offenders: dict[str, list[str]] = {}
+        for rel, path in self._sources():
+            tree = self._tree(path)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                bases = {
+                    (b.attr if isinstance(b, ast.Attribute) else getattr(b, "id", ""))
+                    for b in node.bases
+                }
+                if "IDB_Hooks" not in bases:
+                    continue
+                for item in node.body:
+                    if not isinstance(item, ast.FunctionDef) or item.name != "savebase":
+                        continue
+                    called = self._called_names(item) & {
+                        "flush",
+                        "close",
+                        "save_database",
+                        "savebase",
+                    }
+                    if called:
+                        offenders.setdefault(rel, []).append(
+                            f"{node.name}.savebase: {sorted(called)}"
+                        )
+        self.assertEqual(
+            offenders,
+            {},
+            f"savebase 内不得写数据库（会与保存流程循环等待）: {offenders}",
+        )
+
+    def test_deferred_trace_flush_is_timer_driven(self) -> None:
+        """`savebase` 只置标志，真正的 flush 必须由主循环定时器执行。"""
+        loader = (_SRC_ROOT / "ida_mcp.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "flush_pending",
+            loader,
+            "trace 的延迟 flush 必须挂在主循环定时器上（否则记录永远不落盘）",
+        )
+        trace_src = (_SRC_ROOT / "ida_mcp" / "trace.py").read_text(encoding="utf-8")
+        self.assertIn("def flush_pending", trace_src)
+        self.assertNotIn(
+            "b.flush()\n",
+            trace_src.split("def savebase")[1].split("def closebase")[0],
+            "savebase 内不得直接 flush",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

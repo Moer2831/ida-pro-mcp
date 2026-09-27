@@ -44,7 +44,40 @@ _state: dict[str, Any] = {
     "idb_backend": None,
     "atexit_registered": False,
     "idb_hook": None,
+    "flush_requested": False,
 }
+
+
+def _request_flush() -> None:
+    """只置"待 flush"标志（纯 Python，**不碰 IDB**）。"""
+    with _state_lock:
+        _state["flush_requested"] = True
+
+
+def flush_pending() -> bool:
+    """把 `savebase` 期间攒下的记录真正写入 netnode，返回是否发生了写入。
+
+    **必须在主线程的正常上下文调用**（插件主循环定时器每秒调用一次）。
+
+    为什么不在 `savebase()` 里直接 flush：`savebase()` 是在**数据库保存序列内部**
+    被 IDA 调用的，此刻写 netnode 等于"在保存过程中修改数据库"，会与保存流程形成
+    循环等待 —— 实测表现为：保存后 IDA 主线程死等、CPU 冻结（全部线程 Wait）、
+    界面无响应，而 `.i64` 其实已经写盘；随后所有需要主线程的 MCP 工具（例如
+    `idb_save`）全部超时。对照实验：移出本插件后用 IDA 自带脚本做同样的
+    "反编译 + 保存"完全正常。
+    """
+    with _state_lock:
+        if not _state["flush_requested"]:
+            return False
+        backend = _state["idb_backend"]
+        _state["flush_requested"] = False
+    if backend is None:
+        return False
+    try:
+        backend.flush()
+    except Exception:  # noqa: BLE001 - flush 失败不应影响 IDA
+        return False
+    return True
 
 
 @idasync
@@ -189,12 +222,11 @@ def _install_idb_hook() -> None:
 
     class _TraceFlushHook(ida_idp.IDB_Hooks):
         def savebase(self, *args):
-            b = backend_ref.get("idb_backend")
-            if b is not None:
-                try:
-                    b.flush()
-                except Exception:
-                    pass
+            # **只置标志，绝不在这里写 netnode**：savebase() 处于数据库保存序列内部，
+            # 在此写 IDB 会与保存流程循环等待（实测：保存后主线程死等、CPU 冻结、
+            # 界面无响应，而 .i64 已写盘；随后所有需要主线程的工具全部超时）。
+            # 真正的 flush 交给主线程定时器在正常上下文做（见 flush_pending）。
+            _request_flush()
             return 0
 
         def closebase(self, *args):

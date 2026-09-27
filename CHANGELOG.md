@@ -4,6 +4,23 @@
 上游来源：[QiuChenly/ida-pro-mcp-enhancement](https://github.com/QiuChenly/ida-pro-mcp-enhancement)
 → [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)。
 
+## 2.1.5
+
+主题：**修复"保存 IDB 后卡死"的真正根因**（承接 2.1.4 的调查结论）。
+
+- **根因**：`trace` 模块的 IDB 钩子在 `savebase()` 里调用 `backend.flush()` →
+  `_netnode_flush_segment()` → **在数据库保存序列内部往 netnode 写数据**。
+  这与保存流程形成循环等待：`.i64` 已写盘，但 IDA 主线程死等、CPU 冻结、
+  全部线程 Wait、界面无响应，随后所有需要主线程的 MCP 工具（`idb_save` 等）全部超时。
+- **修复**：`savebase()` 只置一个纯 Python 的"待 flush"标志（不碰 IDB）；
+  真正的落盘改由插件已有的 **1s 主循环定时器** 调用 `flush_pending()` 在正常上下文完成。
+  `closebase()` 行为保持不变（关闭时的最后落盘）。
+- **验证**：修复后连续两轮"写操作（rename + set_type）→ `idb_save`"均返回 `ok`，
+  保存后 IDA 持续 `Responding=True`、CPU 正常推进、缓存重建完成；
+  修复前同一序列 **3/3 次复现卡死**。
+- **防回归**：新增两条静态守卫 —— `IDB_Hooks.savebase()` 内不得出现任何写库动作；
+  延迟 flush 必须由主循环定时器驱动（`ida_mcp.py` 调用 `trace.flush_pending()`）。
+
 ## 2.1.4
 
 主题：**写入类工具全面实测**（rename / patch / put_int / set_type / define / 注释 / 栈 / 类型 …）
