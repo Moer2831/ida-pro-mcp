@@ -1,0 +1,71 @@
+[project]
+name = "ida-pro-mcp"
+version = "2.0.0"
+description = "Vibe reversing with IDA Pro"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Moer2831" },
+    { name = "QiuChenly" },
+    { name = "mrexodia" },
+    { name = "can1357" },
+    { name = "IDA Pro MCP Contributors" },
+]
+keywords = ["ida", "mcp", "llm", "plugin"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+]
+dependencies = [
+    "idapro>=0.0.7",
+    "tomli-w>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "coverage>=7.13.4",
+    "jsonschema>=4.0",
+    "mcp>=1.0",
+]
+
+[project.urls]
+Repository = "https://github.com/Moer2831/ida-pro-mcp"
+Issues = "https://github.com/Moer2831/ida-pro-mcp/issues"
+Enhancement-Upstream = "https://github.com/QiuChenly/ida-pro-mcp-enhancement"
+Original-Upstream = "https://github.com/mrexodia/ida-pro-mcp"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+# uv 工具配置
+# 本项目通常位于外部卷 (如 /Volumes/...)，与 uv 默认缓存目录 (~/.cache/uv)
+# 不在同一文件系统上，APFS clonefile() / reflink 在跨卷场景下会自动回退到
+# full copy 并输出 warning。这里显式声明 copy 模式，消除 warning 并让
+# 安装行为在不同机器上保持一致。
+[tool.uv]
+link-mode = "copy"
+
+[project.scripts]
+ida-pro-mcp = "ida_pro_mcp.server:main"
+idalib-mcp = "ida_pro_mcp.idalib_supervisor:main"
+ida-mcp-test = "ida_pro_mcp.test:main"
+ida-mcp-trace-dump = "ida_pro_mcp.trace_dump:main"
+
+[tool.pyright]
+include = ["src/ida_pro_mcp"]
+
+[tool.ruff]
+exclude = ["src/ida_pro_mcp/ida_mcp/zeromcp/*.py"]
+
+[tool.coverage.run]
+relative_files = true
+include = ["src/ida_pro_mcp/*"]
+omit = [
+    "src/ida_pro_mcp/ida_mcp/tests/*",
+    "src/ida_pro_mcp/ida_mcp/zeromcp/*",
+]
