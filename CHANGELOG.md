@@ -4,6 +4,46 @@
 上游来源：[QiuChenly/ida-pro-mcp-enhancement](https://github.com/QiuChenly/ida-pro-mcp-enhancement)
 → [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)。
 
+## 2.1.7
+
+主题：**修复"IDA 长期无响应"的真凶 —— 缓存分块预算在指纹模式下失效**（生产事故）。
+
+### 事故现象
+
+大库（GameAssembly.dll：806MB、134,942 函数）上，IDA 界面周期性"未响应"，Output 反复刷：
+
+```
+[MCP][cache] 派发耗时 12296ms（>5s）: functions —— IDA 可能正忙…
+[MCP][cache] 构建完成 …: functions=134942, chunks=1, skipped=[], elapsed=12760ms, reason=not-ready
+（约每 13 秒重复一次）
+```
+
+### 根因链条
+
+1. `CacheExtractor.chunk()` 的循环用 `row_count < budget_rows` 约束单次派发的工作量，但
+   **指纹模式（`collect=False`）在 `row_count += 1` 之前就 `continue`** —— `row_count` 恒为 0，
+   于是整张表在一次派发里跑完（13.5 万函数 ⇒ 单次派发 12~13 秒）。
+2. 这 12 秒里 IDA 主线程跑不了插件定时器 ⇒ 我们自己的"主线程心跳"过期。
+3. 派发结束后的门控复查读到过期心跳 ⇒ 判定"IDA 忙" ⇒ **整轮放弃**（`not-ready`，什么都没建成）。
+4. 守护线程立刻重试 ⇒ 又抽一大块 ⇒ 又放弃 …… 死循环，每轮独占主线程十几秒。
+
+### 修复
+
+- fix: **分块预算同时约束 `items` 与 `row_count`**（四个提取器全部修正）。指纹模式按 items
+  受限，采集模式语义不变；首次派发不再可能吞下整表。
+- fix: **每次派发成功后刷新主线程心跳**（`_touch_heartbeat`）。派发成功本身就证明主线程在
+  执行我们的回调，用"派发期间的过期心跳"判死本轮是错的；真正的"IDA 忙/保存中"仍由
+  `savebase` 钩子（`mark_save` → idle=False + 静默窗口）拦截。
+- fix: **连续被门控放弃时指数退避**（2s→4s→…→封顶 30s，`_not_ready_backoff_delay`），
+  并打印"连续 N 轮放弃"日志。避免任何原因导致的"放弃→立刻重试"再次演变成 CPU 死循环。
+- fix: 慢派发日志不再一口咬定"IDA 正忙"，改为"单块偏大或 IDA 正忙"，指向正确的排查方向。
+
+### 测试 399 → 409
+
+新增 `tests/test_cache_chunk_budget.py`（10 项）：指纹模式/采集模式的分块预算、
+"首次派发不得吞下整表"、imports 按模块原子分段且不漏项、两种模式游标一致、
+`_fingerprint_extractor` 的实际派发序列（首块必须用初始预算、每块不超预算）、
+**派发后刷新心跳**（含反向验证：去掉刷新就必须中途放弃）、退避单调且封顶。
 ## 2.1.6
 
 主题：**工具名变更的兼容与可发现性**（多实例实测补测时暴露）。

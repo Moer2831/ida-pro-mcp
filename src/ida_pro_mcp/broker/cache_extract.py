@@ -177,7 +177,11 @@ class StringsExtractor:
         items = 0
         index = cursor
 
-        while index < total and row_count < budget_rows:
+        # 分块预算必须**同时**约束 items 与 row_count：指纹模式（collect=False）不产生
+        # 数据行，row_count 恒为 0，只按它判断会让整张表在一次派发里跑完 —— 实测在
+        # 13.5 万函数的 GameAssembly 库上单次派发 12~13 秒，主线程长期无响应
+        # （插件定时器跑不了 → 心跳过期 → 本轮被门控放弃 → 立刻重试 → 死循环）。
+        while index < total and items < budget_rows and row_count < budget_rows:
             item = self._backend.str_at(index)
             index += 1
             if item is None:
@@ -254,7 +258,7 @@ class FunctionsExtractor:
         items = 0
         index = cursor
 
-        while index < total and row_count < budget_rows:
+        while index < total and items < budget_rows and row_count < budget_rows:
             item = self._backend.func_at(index)
             index += 1
             if item is None:
@@ -330,7 +334,7 @@ class GlobalsExtractor:
         items = 0
         index = cursor
 
-        while index < total and row_count < budget_rows:
+        while index < total and items < budget_rows and row_count < budget_rows:
             item = self._backend.name_at(index)
             index += 1
             if item is None:
@@ -397,7 +401,7 @@ class ImportsExtractor:
         items = 0
         index = cursor
 
-        while index < total and row_count < budget_rows:
+        while index < total and items < budget_rows and row_count < budget_rows:
             module = self._backend.import_module_name(index) or "<unnamed>"
             names = self._backend.import_names(index)
             index += 1

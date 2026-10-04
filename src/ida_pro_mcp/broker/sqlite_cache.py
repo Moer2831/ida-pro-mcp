@@ -158,6 +158,7 @@ def _fingerprint_extractor(
         _warn_if_slow_dispatch(extractor.name, elapsed_ms)
         if result is None:
             return (None, chunks)
+        _touch_heartbeat()  # 我们自己刚在主线程跑完，别让过期心跳把本轮判死
         chunker.observe(max(1, result.items), elapsed_ms)
         chunks += 1
         cursor = result.cursor
@@ -167,12 +168,16 @@ def _fingerprint_extractor(
 
 
 def _warn_if_slow_dispatch(label: str, elapsed_ms: float) -> bool:
-    """单次派发明显偏慢时打日志（下次卡顿时 Output 窗口能直接看出卡在哪一步）。"""
+    """单次派发明显偏慢时打日志（下次卡顿时 Output 窗口能直接看出卡在哪一步）。
+
+    注意：慢**不一定**是 IDA 忙 —— 也可能是我们自己给的单块太大（历史缺陷：指纹模式
+    不受分块预算约束，整表一次抽完）。所以消息里两种可能都提，并交给分块/门控去处理。
+    """
     if elapsed_ms < DISPATCH_WARN_SEC * 1000.0:
         return False
     print(
         f"[MCP][cache] 派发耗时 {elapsed_ms:.0f}ms（>{DISPATCH_WARN_SEC:.0f}s）: {label}"
-        " —— IDA 可能正忙（保存/分析/模态对话框），已按空闲门控等待",
+        " —— 单块偏大或 IDA 正忙；已按分块自适应与空闲门控继续",
         file=sys.stderr,
     )
     return True
@@ -207,10 +212,15 @@ def build_cache(
     stop = should_stop or (lambda: False)
     ready = wait_ready or (lambda: True)
     chunker = chunker or AdaptiveChunker(
-        chunk_rows=cfg.chunk_rows,
+        # 首块从较小值起步：实测大库（13.5 万函数）上用配置值 20000 起步，单次派发要
+        # 6.4 秒，界面会明显卡一下；从 2000 起步约 0.6 秒，之后自适应再放大。
+        chunk_rows=min(cfg.chunk_rows, INITIAL_CHUNK_ROWS),
         target_ms=cfg.target_chunk_ms,
         # 显式配置比 MIN_CHUNK_ROWS 更小时以配置为准，避免自适应把块"放大"回 100 行
         min_rows=max(1, min(cfg.chunk_rows, MIN_CHUNK_ROWS)),
+        # 配置值同时是**硬上限**：否则自适应可能在快机器上把单块放大到远超配置，
+        # 又变回"一次派发占住主线程好几秒"。
+        max_rows=max(1, cfg.chunk_rows),
     )
     stats = CacheStats()
     started_at = time.perf_counter()
@@ -283,6 +293,7 @@ def build_cache(
                 if result is None:
                     dispatch_failed = True
                     break
+                _touch_heartbeat()  # 同上：派发成功 = 主线程在跑我们的回调
                 stats.chunks += 1
                 chunker.observe(max(1, result.row_count or result.items), elapsed_ms)
 
@@ -421,6 +432,8 @@ IDLE_WATCH_INTERVAL_MS = 500  # 主线程空闲定时器的刷新间隔
 IDLE_WATCH_POLL_SEC = 0.25  # 守护线程检查空闲标志的节奏
 SAVE_QUIET_SEC = 5.0  # 收到 IDB 保存信号后再等多久才允许派发
 DISPATCH_WARN_SEC = 5.0  # 单次派发超过该时长就打日志（用于诊断卡顿）
+NOT_READY_BACKOFF_MAX_SEC = 30.0  # 连续因门控放弃时的最大退避
+INITIAL_CHUNK_ROWS = 2_000  # 每轮/每个 pass 的**首块**行数上限（自适应会随后放大）
 NOT_READY_REASON = "not-ready"
 
 
@@ -588,6 +601,21 @@ def refresh_idle_states() -> int:
     return refreshed
 
 
+def _touch_heartbeat() -> None:
+    """记录"主线程刚刚执行完我们的一次派发"。
+
+    为什么必须这么做：一次派发偏慢时（大库/块偏大），主线程在整个派发期间跑不了插件
+    定时器，心跳会过期；若派发一结束就用过期心跳判定"IDA 忙"，本轮会被整轮放弃并立刻
+    重试 —— 实测在 13.5 万函数的 GameAssembly 库上形成"每次抽一大块 + 立即放弃"的
+    死循环（约 13 秒一轮），IDA 界面因此长期无响应。
+
+    派发成功本身就证明主线程活着并在执行我们的回调，所以刷新心跳是正确的；
+    真正"IDA 忙/在保存"仍由 savebase 钩子兜住（mark_save → idle=False + 静默窗口）。
+    """
+    global _last_heartbeat
+    _last_heartbeat = time.monotonic()
+
+
 def _heartbeat_age() -> float:
     """距上一次主线程心跳的秒数（从未心跳过返回 inf）。"""
     if _last_heartbeat <= 0.0:
@@ -648,6 +676,13 @@ def _wait_for_idle(handle: _DaemonHandle) -> bool:
     return False
 
 
+def _not_ready_backoff_delay(streak: int) -> float:
+    """连续第 `streak` 轮被门控放弃时的退避时长（指数增长、封顶）。"""
+    if streak <= 0:
+        return IDLE_POLL_SEC
+    return min(NOT_READY_BACKOFF_MAX_SEC, IDLE_POLL_SEC * (2 ** min(streak - 1, 5)))
+
+
 def _daemon_loop(handle: _DaemonHandle) -> None:
     """守护线程主循环。
 
@@ -690,6 +725,8 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
         if retry:
             handle.force_event.set()
 
+    not_ready_streak = 0
+
     while not handle.stop_event.is_set():
         triggered = handle.force_event.wait(REFRESH_INTERVAL_SEC)
         if handle.stop_event.is_set():
@@ -706,9 +743,22 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
         if not _wait_for_idle(handle):
             break
         if _build():
-            # 门控未放行（IDA 忙/刚保存）：短暂等待后重新排队，避免空转到 30 分钟兜底
-            handle.stop_event.wait(IDLE_POLL_SEC)
+            # 门控未放行（IDA 忙/刚保存）：等待后重新排队，避免空转到 30 分钟兜底。
+            # 连续失败必须**指数退避**：否则一旦每轮都在同一个位置被门控拦下
+            # （历史缺陷：指纹整表一次抽完 → 单块 12s → 心跳过期 → 放弃 → 立刻重试），
+            # 就变成"每十几秒占用主线程一次"的死循环，IDA 长期无响应。
+            not_ready_streak += 1
+            delay = _not_ready_backoff_delay(not_ready_streak)
+            if not_ready_streak >= 3:
+                print(
+                    f"[MCP][cache] 连续 {not_ready_streak} 轮因门控未放行而放弃，"
+                    f"退避 {delay:.1f}s 后重试",
+                    file=sys.stderr,
+                )
+            handle.stop_event.wait(delay)
             handle.force_event.set()
+        else:
+            not_ready_streak = 0
 
 
 def _make_idb_save_hook(handle: _DaemonHandle) -> Any:
