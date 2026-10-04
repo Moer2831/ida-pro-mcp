@@ -44,6 +44,10 @@ DEFAULT_TARGET_CHUNK_MS = 150
 MIN_TARGET_CHUNK_MS = 10
 MAX_TARGET_CHUNK_MS = 5_000
 
+DEFAULT_REBUILD_MIN_INTERVAL_SEC = 20.0
+MAX_REBUILD_MIN_INTERVAL_SEC = 3_600
+DEFAULT_DISK_HEADROOM_FACTOR = 2.0
+
 DEFAULT_SLICE_SPAN = 1 << 20  # 1 MiB：按 EA 区间切片时的默认跨度（预留给区间式后端）
 
 # 表名常量（与 cache_writer.TABLE_SPECS 的 key 保持一致）
@@ -108,6 +112,31 @@ def env_int(
     return value
 
 
+def env_float(
+    env: Mapping[str, str],
+    key: str,
+    default: float,
+    *,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    """解析浮点环境变量并做区间钳制；非法值/NaN 回退 default。"""
+    raw = env.get(key)
+    value: Optional[float] = None
+    if raw is not None and raw.strip():
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            value = None
+    if value is None or value != value:  # NaN != NaN
+        value = default
+    if minimum is not None and value < minimum:
+        value = minimum
+    if maximum is not None and value > maximum:
+        value = maximum
+    return float(value)
+
+
 def env_choice(env: Mapping[str, str], key: str, default: str, choices: tuple[str, ...]) -> str:
     """解析枚举环境变量（大小写不敏感）；非法值回退 default。"""
     raw = env.get(key)
@@ -135,6 +164,12 @@ class CacheConfig:
     incremental: bool = True
     fingerprint: str = FINGERPRINT_SHAPE
     slice_span: int = DEFAULT_SLICE_SPAN
+    # 保存触发的重建最小间隔（秒）：把"连续保存"合并成一轮，避免大库上每按一次
+    # Ctrl+S 就跑一遍 O(条目数) 的指纹 pass。显式 refresh_cache 不受此限。
+    rebuild_min_interval_sec: float = DEFAULT_REBUILD_MIN_INTERVAL_SEC
+    # 磁盘预检：构建前按"现有缓存库大小 × 该倍率 + 影子表峰值"估算需求，
+    # 可用空间不足则拒绝构建（而不是写到一半把盘写满）。
+    disk_headroom_factor: float = DEFAULT_DISK_HEADROOM_FACTOR
 
     @property
     def wants_xrefs(self) -> bool:
@@ -188,6 +223,20 @@ def load_cache_config(env: Optional[Mapping[str, str]] = None) -> CacheConfig:
             VALID_FINGERPRINTS,
         ),
         slice_span=env_int(source, "IDA_MCP_CACHE_SLICE_SPAN", DEFAULT_SLICE_SPAN, minimum=1 << 12),
+        rebuild_min_interval_sec=env_float(
+            source,
+            "IDA_MCP_REBUILD_MIN_INTERVAL_SEC",
+            DEFAULT_REBUILD_MIN_INTERVAL_SEC,
+            minimum=0.0,
+            maximum=MAX_REBUILD_MIN_INTERVAL_SEC,
+        ),
+        disk_headroom_factor=env_float(
+            source,
+            "IDA_MCP_DISK_HEADROOM_FACTOR",
+            DEFAULT_DISK_HEADROOM_FACTOR,
+            minimum=0.0,
+            maximum=100.0,
+        ),
     )
 
 

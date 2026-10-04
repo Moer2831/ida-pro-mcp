@@ -110,6 +110,7 @@ class IdbSaveResult(TypedDict):
     ok: bool
     path: str | None
     error: NotRequired[str]
+    note: NotRequired[str]
 
 
 class FindRegexResult(TypedDict, total=False):
@@ -844,12 +845,28 @@ def imports_query(
     return results
 
 
+# 最近一次保存完成的时间（按目标路径）：大库保存可能超过客户端调用超时，
+# 客户端会报 -32001 "Request timed out"，但保存其实成功了。此后立刻重试时，
+# 若距上次完成很近就直接告知"已经保存过"，避免重复写一遍几百 MB。
+RECENT_SAVE_WINDOW_SEC = 10.0
+_LAST_SAVE_AT: dict[str, float] = {}
+
+
 @tool
 @idasync
 def idb_save(
     path: Annotated[str, "Optional destination path (default: current IDB path)"] = "",
+    force: Annotated[
+        bool, "Save again even if it was saved moments ago (default false)"
+    ] = False,
 ) -> IdbSaveResult:
-    """Save active IDB to disk, optionally to a provided path."""
+    """Save active IDB to disk, optionally to a provided path.
+
+    大库（数百 MB~数 GB）上保存可能超过**客户端**的调用超时：这时你会看到
+    `Request timed out`，但保存往往仍在后台完成、并已落盘。请**不要反复重试** ——
+    10 秒内的重复调用会直接返回"刚刚已保存过"（不会重复写一遍几百 MB）；
+    确实需要再写一次时传 `force=true`。
+    """
     try:
         save_path = path.strip() if path else ""
         if not save_path:
@@ -857,9 +874,22 @@ def idb_save(
         if not save_path:
             return {"ok": False, "path": None, "error": "Could not resolve IDB path"}
 
+        done_at = _LAST_SAVE_AT.get(save_path, 0.0)
+        if not force and done_at and (time.monotonic() - done_at) < RECENT_SAVE_WINDOW_SEC:
+            return {
+                "ok": True,
+                "path": save_path,
+                "note": (
+                    f"刚刚已保存过（{time.monotonic() - done_at:.1f}s 前），未重复写入；"
+                    "需要强制再写一次请传 force=true"
+                ),
+            }
+
         ok = bool(ida_loader.save_database(save_path, 0))
         result: dict = {"ok": ok, "path": save_path}
-        if not ok:
+        if ok:
+            _LAST_SAVE_AT[save_path] = time.monotonic()
+        else:
             result["error"] = "save_database returned false"
         return result
     except Exception as e:

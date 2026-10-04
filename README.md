@@ -640,10 +640,11 @@ MCP 客户端只在会话开始时读一次工具列表，插件升级改名后�
 重连一次即可（重启客户端，或 IDA 里按 `Ctrl+Alt+M`）；也可以直接用当前名字：
 实例列表 `instance_list`、实例切换 `redirect_to_instance`（旧名 `select_instance` 仍可用）。
 
-**Q：`discover_local_instances` 返回空列表？**
+**Q：`discover_local_instances` 还有用吗？**
 
-正常。它查的是旧版的文件注册表（`~/.ida-pro-mcp/instances/`），而新版实例都注册在 Broker 上，
-那个目录是空的。**查实例请用 `instance_list`**。
+它现在只回答"我正跟哪个插件实例说话"（host/port/pid/是否活动）。**查实例清单请用
+`instance_list`**（Broker 是唯一权威来源）。旧版那套"插件写 JSON 文件、MCP 扫目录"的
+文件注册表在新架构下无人写入，恒返回空列表，已在 2.1.8 删除。
 
 **Q：改了仓库代码，但 IDA 行为没变？**
 
@@ -687,6 +688,38 @@ MCP 客户端只在会话开始时读一次工具列表，插件升级改名后�
 | `IDA_MCP_CACHE_MAX_RSS_MB` | `0` | 进程 RSS 上限；超限则停止本轮刷新（保留旧快照）并降级为 `degraded` |
 | `IDA_MCP_CACHE_INCREMENTAL` | `1` | `0` = 关闭表级指纹增量，强制全量重建 |
 | `IDA_MCP_CACHE_FINGERPRINT` | `shape` | `full` 会把字符串文本一起纳入指纹（更精确，建立指纹更慢） |
+| `IDA_MCP_REBUILD_MIN_INTERVAL_SEC` | `20` | 保存触发的重建**最小间隔**：连续保存合并成一轮。大库上每按一次 Ctrl+S 就跑一遍 O(条目数) 指纹是不可接受的；`refresh_cache` 工具不受此限（显式请求立即刷新） |
+| `IDA_MCP_DISK_HEADROOM_FACTOR` | `2.0` | 构建前的磁盘预检倍率：需求 ≈ max(现有缓存库大小, IDB×0.35) × 该倍率（换表时新旧表并存）。可用空间不足则**拒绝构建并保留旧快照**，绝不写爆磁盘 |
+
+**GB 级大库实测（2.1.8，自建合成库：30 万函数 / 300 万交叉引用 / 1.46GB IDB）**
+
+| 指标 | 数值 |
+|------|------|
+| 首次全量构建 | 210 块、24.6 s、`status=ready`、**单次派发 >5s 的次数 = 0** |
+| 单块规模 | 最大 12 978 项 / 12 978 行（预算内） |
+| Python 峰值内存 | **22 MB**（tracemalloc，3.4M 行） |
+| 缓存库大小 | 419 MB（≈ IDB 的 0.29 倍，故 10GB 级 IDB 需预留数 GB 磁盘） |
+| 保存后重建 | 3.0 s，6 张表全部按指纹跳过 |
+| 空闲时 CPU | 构建结束后 **+0**（不再有周期性占用主线程） |
+
+三个让它成立的实现细节：① 分块预算同时约束"条目数"与"条目内派生行数"，单次派发永不
+失控；② 交叉引用枚举走低层 `ida_xref.xrefblk_t`（实测比 `idautils.XrefsTo` 快 **7.3×**，
+只计数快 **17×**）；③ 保存触发的重建与"什么都没变"的轮次都会被合并/跳过。
+
+**GB 级大库的两个环境建议**
+
+1. **关掉 IDA 搜索索引器**：`ida.cfg` 里 `ENABLE_INDEXER = NO`。默认开启时，超大库上
+   索引器会长时间自主烧 CPU，外观和"卡死"几乎一样。
+2. **固定 IDAPython 的解释器**：解释器是按 PATH 找到的，PATH 一变（不同终端/工具启动
+   IDA）就可能换版本，导致 `__pycache__` 混用甚至加载到不受支持的版本。用一个启动器
+   把解释器目录固定在最前面，例如：
+
+   ```bat
+   @echo off
+   set "IDAMCP_PYTHON=C:\Program Files\Python314"
+   set "PATH=%IDAMCP_PYTHON%;%IDAMCP_PYTHON%\Scripts;%PATH%"
+   start "" "D:\IDA\ida.exe" %*
+   ```
 
 **建议**
 

@@ -157,6 +157,34 @@ def ensure_broker_available() -> bool:
     return get_broker_client().ping()
 
 
+DEFAULT_REQUEST_TIMEOUT_SEC = 60.0
+
+# 明确会跑很久的工具：客户端（编辑器/Agent）自己的调用超时我们改不了，但 Broker 这一层
+# 不该比真实耗时更早放弃 —— 早期用统一的 60s，806MB 的 IDB 上 `idb_save` 就出现过
+# "客户端报 -32001 超时、其实保存成功"的误报。
+SLOW_TOOL_TIMEOUTS: dict[str, float] = {
+    "idb_save": 600.0,
+    "survey_binary": 300.0,
+    "analyze_component": 300.0,
+    "analyze_batch": 600.0,
+    "analyze_function": 180.0,
+    "export_funcs": 300.0,
+    "decompile": 180.0,
+    "search_text": 180.0,
+    "redirect_to_instance": 30.0,
+}
+
+
+def _request_timeout(request: dict) -> float:
+    """按方法名给出等待超时（未知方法用默认值）。"""
+    method = request.get("method")
+    if method != "tools/call":
+        return DEFAULT_REQUEST_TIMEOUT_SEC
+    params = request.get("params", {}) or {}
+    name = str(params.get("name") or "")
+    return SLOW_TOOL_TIMEOUTS.get(name, DEFAULT_REQUEST_TIMEOUT_SEC)
+
+
 def route_to_ida(request: dict) -> JsonRpcResponse | None:
     """将请求路由到指定的 IDA 实例 (通过 Broker)。"""
     broker = get_broker_client()
@@ -207,7 +235,7 @@ def route_to_ida(request: dict) -> JsonRpcResponse | None:
         instance_id = args.pop("instance_id")
     # 对于非 tool/call 请求 (例如 resources/read)，由 Broker 根据在册实例数自动选择。
 
-    response = broker.send_request(request, instance_id)
+    response = broker.send_request(request, instance_id, timeout=_request_timeout(request))
     if response is None:
         return {
             "jsonrpc": "2.0",

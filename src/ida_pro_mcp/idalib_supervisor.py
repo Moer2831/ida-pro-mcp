@@ -526,31 +526,14 @@ class IdalibSupervisor:
         return candidates
 
     def _find_gui_instance_for_path(self, resolved_path: str) -> dict[str, Any] | None:
-        candidates = self._candidate_idb_paths(resolved_path)
-        try:
-            instances = _discovery.discover_instances()
-        except Exception:
-            logger.debug("GUI instance discovery failed", exc_info=True)
-            return None
+        """按 IDB 路径找已有 GUI 实例。
 
-        matches = []
-        for instance in instances:
-            idb_path = str(instance.get("idb_path") or "")
-            if not idb_path:
-                continue
-            try:
-                idb_key = self._path_key(idb_path)
-            except Exception:
-                idb_key = os.path.normcase(idb_path)
-            if idb_key in candidates:
-                matches.append(instance)
-
-        if len(matches) > 1:
-            logger.warning(
-                "Multiple GUI IDA instances matched %s; using the first registered instance",
-                resolved_path,
-            )
-        return matches[0] if matches else None
+        早期靠插件写出的 JSON 注册表文件实现；Broker 架构下那段注册表已无人写入
+        （插件只向 Broker 注册，且 Broker 不暴露"哪个实例打开了哪个 IDB"），因此这里
+        恒返回 None —— 与"注册表为空"时的旧行为一致，调用方本来就按"找不到"处理。
+        """
+        logger.debug("GUI instance discovery by path is not available: %s", resolved_path)
+        return None
 
     def _register_session_locked(self, session: WorkerSession, resolved_path: str, context_id: str | None) -> None:
         self.sessions[session.session_id] = session

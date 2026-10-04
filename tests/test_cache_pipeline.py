@@ -711,6 +711,11 @@ class DaemonLoopTests(unittest.TestCase):
             "ida_pro_mcp.broker.cache_backend.dispatch_available", lambda: False
         )
         patcher.start()
+        # 关掉"保存合并窗口"：本用例测的是主循环机制，不是合并策略（否则要等 20s）
+        env_patcher = mock.patch.dict(
+            os.environ, {"IDA_MCP_REBUILD_MIN_INTERVAL_SEC": "0"}
+        )
+        env_patcher.start()
         try:
             handle = self._handle()
             worker = threading.Thread(
@@ -746,6 +751,7 @@ class DaemonLoopTests(unittest.TestCase):
         finally:
             sqlite_cache._backend_factory = original_factory  # noqa: SLF001
             patcher.stop()
+            env_patcher.stop()
 
 
 class DispatchTests(unittest.TestCase):

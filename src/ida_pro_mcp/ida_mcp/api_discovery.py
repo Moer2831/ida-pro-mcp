@@ -18,7 +18,7 @@ from typing import Annotated, NotRequired, TypedDict
 
 from .rpc import tool, MCP_SERVER
 from .zeromcp import EXTERNAL_BASE_HEADER, get_current_request_external_base_url
-from .discovery import discover_instances, probe_instance
+from .discovery import probe_instance
 
 
 class InstanceSelectionResult(TypedDict, total=False):
@@ -335,54 +335,29 @@ MCP_SERVER.registry.dispatch = _redirecting_dispatch
 
 @tool
 def discover_local_instances() -> list[InstanceListItem]:
-    """List IDA instances found by scanning this machine (host/port), with reachability and
-    which one currently handles your calls.
+    """Report the IDA instance that is currently handling your calls (host/port/pid), with
+    reachability and whether it is the active target.
 
-    Needs an `instance_id` argument to be routed (get one from the no-argument `instance_list`,
-    which lists the instances registered with the Broker). Use this tool only when you need the
-    local-scan view, e.g. an IDA window that is not connected to the Broker yet.
-
-    NOTE: with the Broker architecture the authoritative list is the no-argument `instance_list`
-    (Broker 注册表)。本工具只做两件事：① 扫描旧的文件注册表
-    （`~/.ida-pro-mcp/instances/instance_*.json`，新架构下通常为空）；② **始终包含当前
-    正在处理本次调用的实例**，这样结果不会因为注册表为空而误导性地变成 `[]`。
+    NOTE: with the Broker architecture the authoritative instance list is the no-argument
+    `instance_list` (Broker 注册表)。本工具回答的是另一个问题："我现在正跟哪个插件实例
+    说话"。早期版本靠扫描插件写出的 JSON 注册表文件，那段代码在 Broker 架构下永远不会
+    有内容（恒返回 `[]`），现已删除。
     """
-    instances = discover_instances()
-    result = []
     redirect = get_redirect_target()
-    seen_local = False
-    for inst in instances:
-        reachable = probe_instance(inst["host"], inst["port"])
-        if redirect:
-            active = inst["host"] == redirect[0] and inst["port"] == redirect[1]
-        else:
-            active = inst["host"] == _LOCAL_HOST and inst["port"] == _LOCAL_PORT
-        if active:
-            seen_local = True
-        result.append({
-            **inst,
-            "reachable": reachable,
+    active = redirect is None or (
+        redirect[0] == _LOCAL_HOST and redirect[1] == _LOCAL_PORT
+    )
+    port = _LOCAL_PORT or 0
+    return [
+        {  # type: ignore[list-item]
+            "host": _LOCAL_HOST,
+            "port": port,
+            "pid": os.getpid(),
+            "reachable": probe_instance(_LOCAL_HOST, port) if port else True,
             "active": active,
-            "source": "registry",
-        })
-
-    # 当前实例兜底：旧注册表为空时也要能回答"我正跟谁说话"。
-    # 注意不能要求 `_LOCAL_PORT` 存在 —— Broker 架构下插件从不调用
-    # `set_local_instance()`，该值一直是 None（实测最后一行日志就是 `127.0.0.1:None`），
-    # 若以此为条件兜底永远不触发，结果仍是误导性的空列表。
-    if not seen_local:
-        result.insert(
-            0,
-            {  # type: ignore[arg-type]
-                "host": _LOCAL_HOST,
-                "port": _LOCAL_PORT or 0,
-                "pid": os.getpid(),
-                "reachable": True,
-                "active": redirect is None,
-                "source": "current",
-            },
-        )
-    return result
+            "source": "current",
+        }
+    ]
 
 
 @tool

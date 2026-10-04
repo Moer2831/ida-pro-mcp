@@ -194,6 +194,7 @@ def build_cache(
     wait_ready: Optional[Callable[[], bool]] = None,
     rss_limit_mb: Optional[int] = None,
     idb_mtime: float = 0.0,
+    expected_bytes: int = 0,
 ) -> CacheStats:
     """执行一轮缓存构建（守护线程与单测共用同一实现）。
 
@@ -207,10 +208,23 @@ def build_cache(
         wait_ready: 派发前置条件（IDA 空闲且不在保存后的静默窗口内）；返回 False 时
             本轮以 `NOT_READY_REASON` 中止并保留旧快照，等下次触发重试。
         rss_limit_mb: 覆盖配置里的 RSS 上限（单测用）。
+        expected_bytes: 预估本轮需要的字节数（用于磁盘预检；0 表示只按现有库大小估）。
     """
     cfg = config or load_cache_config()
     stop = should_stop or (lambda: False)
     ready = wait_ready or (lambda: True)
+    disk_problem = _disk_preflight(
+        db_path, expected_bytes=expected_bytes, factor=cfg.disk_headroom_factor
+    )
+    if disk_problem:
+        # 磁盘不够就**拒绝构建**（而不是写一半把盘写满）：保留旧快照，报明确原因，
+        # 且不参与"立刻重试"逻辑（重试同样会失败，只会白烧 IO）。
+        print(f"[MCP][cache] 拒绝构建：{disk_problem}", file=sys.stderr)
+        refused = CacheStats()
+        refused.status = STATUS_ERROR
+        refused.reason = DISK_RISK_REASON
+        refused.elapsed_ms = 0.0
+        return refused
     chunker = chunker or AdaptiveChunker(
         # 首块从较小值起步：实测大库（13.5 万函数）上用配置值 20000 起步，单次派发要
         # 6.4 秒，界面会明显卡一下；从 2000 起步约 0.6 秒，之后自适应再放大。
@@ -434,6 +448,9 @@ SAVE_QUIET_SEC = 5.0  # 收到 IDB 保存信号后再等多久才允许派发
 DISPATCH_WARN_SEC = 5.0  # 单次派发超过该时长就打日志（用于诊断卡顿）
 NOT_READY_BACKOFF_MAX_SEC = 30.0  # 连续因门控放弃时的最大退避
 INITIAL_CHUNK_ROWS = 2_000  # 每轮/每个 pass 的**首块**行数上限（自适应会随后放大）
+MIN_FREE_DISK_BYTES = 256 * 1024 * 1024  # 磁盘预检下限（首次构建没有历史大小时用）
+CACHE_TO_IDB_RATIO = 0.35  # 缓存库大小 ≈ IDB × 该值（实测 1.46GB IDB → 419MB 缓存）
+DISK_RISK_REASON = "disk-space"
 NOT_READY_REASON = "not-ready"
 
 
@@ -501,6 +518,13 @@ class _DaemonHandle:
     idle_backend: Any = None
     slow_dispatches: int = 0
     pauses: int = 0
+    # 显式刷新请求（refresh_cache 工具）：不受"保存合并窗口"限制
+    force_now: bool = False
+    # 上一轮成功构建时的 IDB 廉价签名与配置签名（用于跳过"什么都没变"的重建）
+    last_build_sig: str = ""
+    last_build_config: str = ""
+    last_build_sig_valid: bool = False
+    last_build_monotonic: float = 0.0
 
 
 _daemons: dict[str, _DaemonHandle] = {}
@@ -519,12 +543,101 @@ def _ida_idb_mtime(idb_path: str) -> float:
         return 0.0
 
 
+def _idb_sig(idb_path: str) -> str:
+    """IDB 文件的廉价签名（大小 + mtime 秒）。
+
+    用于跳过"IDB 根本没变"的重建：大库上指纹 pass 是 O(条目数) 的主线程工作量，
+    没必要在什么都没变时白跑一遍。
+    """
+    try:
+        st = os.stat(idb_path)
+        return f"{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        return ""
+
+
+def _config_sig(config: CacheConfig) -> str:
+    """构建配置签名：配置变了就必须重建（否则指纹会拿旧配置的库当"没变"）。"""
+    return (
+        f"{config.scope}|{config.chunk_rows}|{config.incremental}|"
+        f"{config.fingerprint}|{config.max_rows}|{','.join(config.tables())}"
+    )
+
+
+def _idb_unchanged(handle: _DaemonHandle, config: CacheConfig) -> bool:
+    """IDB 与配置都与上一轮**成功**构建一致 → 本轮可以整轮跳过。"""
+    if not handle.last_build_sig_valid or not handle.last_build_sig:
+        return False
+    if handle.last_build_config != _config_sig(config):
+        return False
+    return _idb_sig(handle.idb_path) == handle.last_build_sig
+
+
+def _coalesce_wait(handle: _DaemonHandle, min_interval: float) -> float:
+    """保存触发时还需等多久才允许重建（把连续保存合并成一轮）。"""
+    if min_interval <= 0 or handle.last_build_monotonic <= 0:
+        return 0.0
+    return max(0.0, handle.last_build_monotonic + min_interval - time.monotonic())
+
+
+def _cache_db_size(db_path: str) -> int:
+    """缓存库当前大小（含 -wal/-shm；不存在按 0）。"""
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            total += os.path.getsize(db_path + suffix)
+        except OSError:
+            continue
+    return total
+
+
+def _expected_cache_bytes(handle: _DaemonHandle) -> int:
+    """预估本轮缓存库需要多大（磁盘预检用）。
+
+    有现成缓存库时以它为准（重建后大小基本相当）；首次构建没有历史大小时，用 IDB
+    大小 × 经验比例估算（实测 1.46GB IDB 产出 419MB 缓存 ≈ 0.29，这里取 0.35 留余量）。
+    """
+    current = _cache_db_size(handle.db_path)
+    if current > 0:
+        return current
+    try:
+        return int(os.path.getsize(handle.idb_path) * CACHE_TO_IDB_RATIO)
+    except OSError:
+        return 0
+
+
+def _disk_preflight(db_path: str, *, expected_bytes: int, factor: float) -> str:
+    """构建前的磁盘空间预检：返回非空字符串表示**空间不足，应拒绝构建**。
+
+    为什么需要：缓存库大约是 IDB 的 0.3 倍（实测 1.46GB IDB → 419MB 缓存），而换表时
+    新旧表会同时存在（峰值约 2× 最大表）。10GB 级 IDB 上缓存可达数 GB，写爆磁盘会变成
+    生产事故 —— 后果比"缓存旧一点"严重得多。宁可拒绝并给出明确提示。
+    """
+    import shutil
+
+    try:
+        free = shutil.disk_usage(os.path.dirname(os.path.abspath(db_path)) or ".").free
+    except OSError:
+        return ""  # 探测不了就别挡路（例如网络盘/权限受限）
+    need = int(max(_cache_db_size(db_path), max(0, expected_bytes)) * max(0.0, factor))
+    if need < MIN_FREE_DISK_BYTES:
+        need = MIN_FREE_DISK_BYTES
+    if free >= need:
+        return ""
+    return (
+        f"可用空间不足：需要约 {need / 1e9:.2f}GB（含换表峰值，倍率 {factor:.1f}），"
+        f"实际可用 {free / 1e9:.2f}GB。可清理磁盘，或调小 "
+        f"IDA_MCP_DISK_HEADROOM_FACTOR / 用 IDA_MCP_CACHE_SCOPE=minimal 减少数据量。"
+    )
+
+
 def _run_build_once(
     handle: _DaemonHandle,
     backend: Any,
     config: CacheConfig,
 ) -> CacheStats:
     """执行一轮构建并刷新守护线程状态。"""
+    sig_at_start = _idb_sig(handle.idb_path)
     stats = build_cache(
         handle.db_path,
         backend,
@@ -532,12 +645,24 @@ def _run_build_once(
         should_stop=handle.stop_event.is_set,
         wait_ready=lambda: _gate_ready(handle),
         idb_mtime=_ida_idb_mtime(handle.idb_path),
+        # 首次构建时缓存库还不存在，用 IDB 大小按经验比例预估（磁盘预检需要）
+        expected_bytes=_expected_cache_bytes(handle),
     )
     handle.last_stats = stats
     handle.builds += 1
     if NOT_READY_REASON in stats.reason:
         handle.pauses += 1
     handle.slow_dispatches += stats.slow_dispatches
+    handle.last_build_monotonic = time.monotonic()
+    # 只有"完整成功"的一轮才允许下次整轮跳过；用**构建开始时**的签名（构建期间若发生
+    # 保存，签名就对不上，下一轮自然会重跑，不会漏更新）。
+    handle.last_build_sig = sig_at_start
+    handle.last_build_config = _config_sig(config)
+    handle.last_build_sig_valid = (
+        stats.status == "ready"
+        and not stats.partial
+        and NOT_READY_REASON not in stats.reason
+    )
     handle.progress = TableProgress(
         table="",
         phase="idle",
@@ -732,14 +857,38 @@ def _daemon_loop(handle: _DaemonHandle) -> None:
         if handle.stop_event.is_set():
             break
         handle.force_event.clear()
-        if not triggered:
-            mtime = _ida_idb_mtime(handle.idb_path)
-            if mtime and mtime == handle.last_idb_mtime:
+        forced = handle.force_now
+        handle.force_now = False
+
+        if not triggered and not forced:
+            # 30 分钟兜底：IDB 没有任何变化就别跑（尤其别白跑 O(条目数) 的指纹 pass）
+            if _idb_unchanged(handle, config):
                 print(
                     f"[MCP][cache] IDB 未变化，跳过重建: {handle.idb_path}",
                     file=sys.stderr,
                 )
                 continue
+
+        if not forced:
+            # 保存触发的重建做**合并**：大库上每按一次 Ctrl+S 就跑一遍指纹 pass
+            # （百万级条目要几十秒到几分钟主线程工作量）是不可接受的。
+            remaining = _coalesce_wait(handle, config.rebuild_min_interval_sec)
+            if remaining > 0:
+                print(
+                    f"[MCP][cache] 合并保存触发：等 {remaining:.1f}s 后再重建",
+                    file=sys.stderr,
+                )
+                if handle.stop_event.wait(remaining):
+                    break
+                if handle.force_now:
+                    handle.force_now = False
+                elif _idb_unchanged(handle, config):
+                    print(
+                        "[MCP][cache] 合并窗口内 IDB 无净变化，跳过重建",
+                        file=sys.stderr,
+                    )
+                    continue
+
         if not _wait_for_idle(handle):
             break
         if _build():
@@ -829,11 +978,15 @@ def start_cache_daemon(idb_path: str) -> Optional[str]:
 
 
 def request_refresh(idb_path: str) -> bool:
-    """唤醒指定 IDB 对应的守护线程立即进行一次刷新。"""
+    """唤醒指定 IDB 对应的守护线程立即进行一次刷新。
+
+    标记 `force_now`：显式请求**不受**保存合并窗口限制（用户/工具要的是立刻刷新）。
+    """
     with _daemons_lock:
         handle = _daemons.get(idb_path)
     if handle is None:
         return False
+    handle.force_now = True
     handle.force_event.set()
     return True
 
