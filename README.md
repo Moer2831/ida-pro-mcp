@@ -474,6 +474,37 @@ stdio 客户端可使用：
 uv run idalib-mcp --stdio
 ```
 
+### 进程生命周期与"孤儿 worker"（2.1.9）
+
+无头模式是 supervisor + 每库一个 worker 的多进程结构，因此**父进程消失后必须有人收拾
+worker**，否则残留 worker 会一直占着 IDB，下一次启动无头服务时开库阻塞、`initialize`
+永远不返回。这里踩过两个坑，最终用操作系统级方案解决：
+
+| 方案 | 结果 |
+|------|------|
+| 按 PID 探活父进程 | ❌ 实测被 **PID 复用**骗过：supervisor 死掉后其 PID 立刻被另一个会话的进程占用，`OpenProcess` 竟然成功 |
+| 管道 EOF（`sys.stdin`） | ❌ worker 里 `sys.stdin` 可能为 None（看门狗根本没启动）；进程链上的 re-exec 子进程还会继承句柄让 EOF 永不到来 |
+| **Job Object（`KILL_ON_JOB_CLOSE`）** | ✅ supervisor 进程无论怎么消失（正常退出 / 任务管理器 / 崩溃），内核立刻终止全部 worker 及其后代 |
+
+具体加固：worker 在 spawn 后立即加入 supervisor 的 Job；worker 另监听 fd 0 的 EOF 作为
+第二保险；启动打开初始库有上界 `--open-timeout`（环境变量 `IDA_MCP_OPEN_TIMEOUT_SEC`，
+默认 90 秒），超时会给出可操作报错而不是静默挂住。
+
+**在 DSH / 任意 MCP 客户端里配置无头服务**：
+
+```json
+{
+  "mcpServers": {
+    "ida-headless": {
+      "command": "D:\\AIMCP\\ida-pro-mcp\\.venv\\Scripts\\idalib-mcp.exe",
+      "args": ["--stdio", "--max-workers", "2", "--idle-ttl", "600", "--idle-sweep", "30"]
+    }
+  }
+}
+```
+
+不带初始文件启动时用 `idalib_open("/path/to/binary")` 动态打开，`idalib_list` 查看会话，
+`idalib_close` 释放（配合 `--idle-ttl` 可自动回收）。
 `idalib-mcp` 是一个 supervisor：每个打开的数据库由独立 idalib worker 进程承载。若请求的 IDB 已经在运行插件的 GUI IDA 中打开，`idalib-mcp` 会优先路由到该 GUI 实例；GUI 实例消失后，下次请求会在可行时回退到无头 worker。需要让回退看到 GUI 中的改动时，请先保存 IDB。
 
 工具可通过当前 MCP 上下文绑定的数据库执行，也可以显式传 `database` 参数指定 session ID、文件名或输入路径：

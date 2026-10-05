@@ -4,6 +4,45 @@
 上游来源：[QiuChenly/ida-pro-mcp-enhancement](https://github.com/QiuChenly/ida-pro-mcp-enhancement)
 → [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)。
 
+## 2.1.9
+
+主题：**无头模式（idalib-mcp）的进程生命周期加固** —— 修掉"supervisor 死后 worker 变孤儿、
+新实例永远起不来"。
+
+### 事故与根因
+
+无头模式是 supervisor + 每库一个 worker 的多进程结构（实测进程链：
+`idalib-mcp.exe → python → python(supervisor) → worker → worker 的子进程`）。
+supervisor 被强杀后 worker 残留并继续占着 IDB，于是**下一次启动无头服务时开库阻塞，
+MCP `initialize` 永不返回**（实测挂满 180s，日志里只有一行 `Spawning idalib worker`）。
+
+排查中否掉了两个"看起来对"的方案：
+
+| 方案 | 为什么不行 |
+|------|-----------|
+| 按 PID 探活父进程 | **PID 复用**：supervisor 死后其 PID 立刻被另一个会话的进程占用，`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` 返回成功且 `GetLastError()==0`，看门狗以为父进程还活着 |
+| 管道 EOF（读 `sys.stdin`） | worker 里 `sys.stdin` 可能为 None 或被 IDA 替换（看门狗根本没启动）；且进程链上的 re-exec 子进程会继承句柄，EOF 永远不来 |
+
+### 修复
+
+- fix: **Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）**：worker 一 spawn 就加入
+  supervisor 的 Job。supervisor 进程无论怎么消失（正常退出 / TerminateProcess / 崩溃），
+  内核立刻终止全部 worker 及后代 —— 不受句柄继承与 PID 复用影响。实测强杀后 worker
+  **0.5 秒内全部退出**，同库新实例 `initialize` 0.83s 成功。
+- fix: worker 额外监听 **fd 0 的 EOF**（`os.read(0, 1)`，不依赖 `sys.stdin`）作为第二保险；
+  通道不可用时绝不自杀。
+- fix: `shutdown()` 先关 stdin 让 worker 走优雅退出，再关 Job 兜底清理。
+- fix: 启动打开初始库**有上界** `--open-timeout`（`IDA_MCP_OPEN_TIMEOUT_SEC`，默认 90s），
+  超时给出可操作报错（提示残留 worker / GUI 占用与清理方式），不再静默挂住 `initialize`。
+- 新增 `src/ida_pro_mcp/proc_util.py`：`pid_alive` / `start_parent_watchdog` /
+  `start_fd_eof_watchdog` / `create_kill_on_close_job` / `assign_pid_to_job` / `close_job`。
+- README 补"进程生命周期与孤儿 worker"一节 + DSH 无头配置示例。
+
+### 测试 447 → 457
+
+新增 `tests/test_proc_util.py`：Job Object 创建/加成员/**关句柄即杀成员**（端到端）、
+fd EOF 看门狗（含真实子进程：父进程关写端后子进程以约定退出码自退）、PID 复用的危险必须
+写进 `pid_alive` 文档、以及 supervisor/worker 接线的源码形态守卫。
 ## 2.1.8
 
 主题：**面向 GB 级大库的根因修复与性能提升**（自建 1.46GB 合成库实测，未使用任何用户样本）。

@@ -18,9 +18,11 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from .proc_util import assign_pid_to_job, close_job, create_kill_on_close_job
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -31,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 STDIO_DEFAULT_CONTEXT_ID = "stdio:default"
 SHARED_FALLBACK_CONTEXT_ID = "shared:fallback"
+DEFAULT_OPEN_TIMEOUT_SEC = 90.0
 IDLE_TTL_ENV = "IDA_MCP_IDLE_TTL_SEC"
 IDLE_SWEEP_ENV = "IDA_MCP_IDLE_SWEEP_SEC"
 DEFAULT_IDLE_TTL_SEC = 0.0
@@ -264,6 +267,8 @@ class IdalibSupervisor:
         self._tools_cache: dict[tuple[str, ...], list[dict]] = {}
         self._resources_cache: dict[str, list[dict]] = {}
         self._lock = RLock()
+        # 'supervisor 一死就杀掉全部 worker' 的 Job 句柄（Windows；惰性创建）
+        self._job: int | None = None
 
     # ------------------------------------------------------------------
     # Context helpers
@@ -327,16 +332,34 @@ class IdalibSupervisor:
             "127.0.0.1",
             "--port",
             str(port),
+            # worker 必须知道自己属于谁：supervisor 被强杀时（任务管理器 / TerminateProcess，
+            # 不走 shutdown()），worker 由看门狗自行退出，避免变成孤儿继续占着 IDB，
+            # 让之后的无头服务开库阻塞、initialize 永不返回。
+            "--parent-pid",
+            str(os.getpid()),
+            # 明确开关：只有被 supervisor 拉起时才启用"stdin EOF = 父进程没了"，
+            # 避免手工运行 worker（stdin 是终端/DEVNULL）时立刻自行退出。
+            "--watch-stdin-eof",
             *self.worker_args,
         ]
         logger.info("Spawning idalib worker on 127.0.0.1:%d", port)
         process = subprocess.Popen(
             cmd,
-            stdin=subprocess.DEVNULL,
+            # stdin 用管道（不是 DEVNULL）：worker 通过**管道 EOF** 感知我们消失 ——
+            # 进程无论怎么死，句柄都会被系统关闭，worker 立刻读到 EOF 并退出。
+            # 这比按 PID 探活可靠：PID 会被复用（实测 supervisor 死后其 PID 立刻被
+            # 另一个会话里的进程占用，OpenProcess 竟然成功，worker 于是永不退出）。
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=self._worker_env(),
         )
+        # 把 worker 放进"supervisor 一死就全杀"的 Job：这是唯一不被句柄继承/PID 复用
+        # 破坏的父子通道（两者都实测踩过）。
+        if self._job is None:
+            self._job = create_kill_on_close_job()
+        if self._job:
+            assign_pid_to_job(self._job, process.pid)
         worker = WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
             input_path="",
@@ -377,10 +400,21 @@ class IdalibSupervisor:
         proc = worker.process
         if proc is None or proc.poll() is not None:
             return
+        # 优雅路径：关掉 stdin 管道 → worker 的 EOF 看门狗自行收尾退出
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:  # noqa: BLE001 - 关不上就直接走强杀
+            pass
+        try:
+            proc.wait(timeout=5)
+            return
+        except Exception:  # noqa: BLE001
+            pass
         try:
             proc.terminate()
             proc.wait(timeout=10)
-        except Exception:
+        except Exception:  # noqa: BLE001
             proc.kill()
             proc.wait(timeout=5)
 
@@ -395,6 +429,10 @@ class IdalibSupervisor:
             self._schema_worker = None
         for worker in workers:
             self._terminate_worker(worker)
+        # 关掉 Job：即便有 worker 没被优雅终止（或它又 re-exec 了子进程），内核也会清理
+        if self._job:
+            close_job(self._job)
+            self._job = None
 
     def _schema_or_idle_worker(self) -> WorkerSession:
         with self._lock:
@@ -1285,6 +1323,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Restrict worker tools to names listed in a profile file.",
     )
     parser.add_argument(
+        "--open-timeout",
+        type=float,
+        default=_env_float("IDA_MCP_OPEN_TIMEOUT_SEC", DEFAULT_OPEN_TIMEOUT_SEC),
+        metavar="SEC",
+        help=(
+            "How long to wait for the initial database to open before failing with an "
+            f"actionable error (env IDA_MCP_OPEN_TIMEOUT_SEC, default: {DEFAULT_OPEN_TIMEOUT_SEC:g}). "
+            "Opening can block if another idalib worker or a GUI IDA still holds the database."
+        ),
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=int(os.environ.get("IDA_MCP_MAX_WORKERS", "4")),
@@ -1342,10 +1391,33 @@ def main() -> None:
 
     if args.input_path is not None:
         startup_context_id = STDIO_DEFAULT_CONTEXT_ID if args.isolated_contexts else SHARED_FALLBACK_CONTEXT_ID
-        try:
-            supervisor.open_session(str(args.input_path), context_id=startup_context_id)
-        except Exception as e:
-            raise SystemExit(f"Failed to open initial binary: {e}")
+        # 开库可能被"仍占着这个库的进程"阻塞（残留 worker，或 GUI IDA 正开着它）。
+        # 这里给上界：超时就带可操作提示退出，绝不让 MCP 永远不回 initialize
+        # （实测症状：客户端 initialize 挂到超时，日志里只有一行 Spawning worker）。
+        opened: dict = {}
+
+        def _open_initial() -> None:
+            try:
+                opened["session"] = supervisor.open_session(
+                    str(args.input_path), context_id=startup_context_id
+                )
+            except Exception as exc:  # noqa: BLE001 - 由主线程统一报错
+                opened["error"] = exc
+
+        opener = threading.Thread(target=_open_initial, name="startup-open", daemon=True)
+        opener.start()
+        opener.join(timeout=max(1.0, args.open_timeout))
+        if opener.is_alive():
+            raise SystemExit(
+                f"打开初始库超过 {args.open_timeout:.0f}s 仍未完成：{args.input_path}\n"
+                "最可能的原因：该库仍被别的进程占用 —— 上一次 idalib supervisor 被强杀后"
+                "残留的 worker，或 GUI IDA 正开着同一个库。\n"
+                "处理：结束残留 worker（tasklist | findstr idalib_server，然后 "
+                "taskkill /PID <pid> /F），或先关掉 GUI 里的库；"
+                "等待上限可用 --open-timeout / IDA_MCP_OPEN_TIMEOUT_SEC 调整。"
+            )
+        if "error" in opened:
+            raise SystemExit(f"Failed to open initial binary: {opened['error']}")
 
     def cleanup_and_exit(signum, frame):
         logger.info("Shutting down idalib supervisor...")

@@ -572,6 +572,23 @@ def main():
         ),
     )
     parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=0,
+        help=(
+            "Supervisor PID (secondary signal). PID reuse makes this unreliable on its "
+            "own; --watch-stdin-eof is the authoritative channel."
+        ),
+    )
+    parser.add_argument(
+        "--watch-stdin-eof",
+        action="store_true",
+        help=(
+            "Exit when stdin reaches EOF, i.e. when the supervisor process is gone "
+            "(pipe handle closed by the OS). Passed by idalib-mcp for every worker."
+        ),
+    )
+    parser.add_argument(
         "input_path",
         type=Path,
         nargs="?",
@@ -594,6 +611,32 @@ def main():
 
     mode = "isolated-contexts" if _ISOLATED_CONTEXTS_ENABLED else "shared-fallback"
     logger.info("idalib session mode: %s", mode)
+
+    # 父进程看门狗：supervisor 被强杀（不走 shutdown）时，本 worker 必须自己退出，
+    # 否则它会一直占着 IDB，导致下次启动无头服务时开库阻塞、initialize 永不返回。
+    def _on_parent_gone() -> None:
+        logger.warning("Supervisor process %s is gone; exiting worker", args.parent_pid)
+        try:
+            get_session_manager().close_all_sessions()
+        except Exception:  # noqa: BLE001 - 收尾失败也必须退出
+            logger.debug("close_all_sessions during parent exit failed", exc_info=True)
+        os._exit(0)
+
+    from .proc_util import (  # noqa: PLC0415
+        start_eof_watchdog,
+        start_fd_eof_watchdog,
+        start_parent_watchdog,
+    )
+
+    # 主通道：管道 EOF。supervisor 只持有写端，它一死句柄就被系统关闭，我们立刻读到
+    # EOF —— 不依赖 PID，因此不受 PID 复用影响（实测按 PID 探活会被复用骗过）。
+    # 优先直接读 fd 0：worker 里 `sys.stdin` 可能是 None 或被 IDA 换掉，用 sys.stdin.buffer
+    # 会导致看门狗根本不启动（实测孤儿就是这样留下的）。
+    if args.watch_stdin_eof:
+        if start_fd_eof_watchdog(0, _on_parent_gone) is None:
+            start_eof_watchdog(getattr(sys.stdin, "buffer", None), _on_parent_gone)
+    # 次要信号：PID 探活（PID 复用可能误判，仅作兜底）
+    start_parent_watchdog(args.parent_pid, _on_parent_gone)
 
     session_manager = get_session_manager()
 
